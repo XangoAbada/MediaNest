@@ -3,6 +3,8 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::UNIX_EPOCH;
 
 use rusqlite::Connection;
@@ -29,14 +31,13 @@ struct SourceFile {
     abs: PathBuf,
     kind: i64,
     size: i64,
-    dst_dir: String,
+    mtime: i64,
+    src_folder: String,
 }
 
-fn scan_source(
-    source: &Path,
-    photo_template: &str,
-    video_template: &str,
-) -> Vec<SourceFile> {
+/// Lekki skan: tylko walk + stat (bez EXIF, bez hasha). `total` znany szybko,
+/// a kosztowny EXIF/hash liczony jest dopiero w pętli `run_core` z postępem.
+fn scan_source(source: &Path) -> Vec<SourceFile> {
     walkdir::WalkDir::new(source)
         .into_iter()
         .filter_map(Result::ok)
@@ -50,27 +51,30 @@ fn scan_source(
                 .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
                 .map(|d| d.as_secs() as i64)
                 .unwrap_or(0);
-            // dla zdjęć data z EXIF, fallback mtime
-            let taken_at = if kind == 0 {
-                indexer::read_exif(e.path()).1.unwrap_or(mtime)
-            } else {
-                mtime
-            };
             let src_folder = e
                 .path()
                 .parent()
                 .and_then(|p| p.file_name())
                 .map(|n| n.to_string_lossy().to_string())
                 .unwrap_or_default();
-            let template = if kind == 0 { photo_template } else { video_template };
             Some(SourceFile {
                 abs: e.path().to_path_buf(),
                 kind,
                 size: meta.len() as i64,
-                dst_dir: apply_template(template, taken_at, kind, &src_folder),
+                mtime,
+                src_folder,
             })
         })
         .collect()
+}
+
+/// Data pliku dla szablonu: dla zdjęć z EXIF (fallback mtime), dla wideo mtime.
+fn taken_at_of(f: &SourceFile) -> i64 {
+    if f.kind == 0 {
+        indexer::read_exif(&f.abs).1.unwrap_or(f.mtime)
+    } else {
+        f.mtime
+    }
 }
 
 #[derive(serde::Serialize)]
@@ -83,11 +87,14 @@ pub struct ImportPlan {
 }
 
 pub fn plan(source: &Path, photo_template: &str, video_template: &str) -> ImportPlan {
-    let files = scan_source(source, photo_template, video_template);
+    let files = scan_source(source);
     let mut tree: BTreeMap<String, u64> = BTreeMap::new();
     let (mut photos, mut videos, mut total_size) = (0u64, 0u64, 0i64);
     for f in &files {
-        *tree.entry(f.dst_dir.clone()).or_default() += 1;
+        // podgląd grupuje po mtime (bez EXIF) — szybki, przybliżony dla dużych folderów
+        let template = if f.kind == 0 { photo_template } else { video_template };
+        let dst_dir = apply_template(template, f.mtime, f.kind, &f.src_folder);
+        *tree.entry(dst_dir).or_default() += 1;
         total_size += f.size;
         if f.kind == 0 {
             photos += 1;
@@ -188,6 +195,11 @@ fn copy_verified(
         "INSERT INTO operation_items (op_id, src, dst) VALUES (?1, ?2, ?3)",
         rusqlite::params![op_id, src.to_string_lossy(), dst_rel],
     )?;
+    // rejestr źródła — re-skan tego samego folderu pomija je bez hashowania
+    conn.execute(
+        "INSERT OR IGNORE INTO imported (src, imported_at) VALUES (?1, ?2)",
+        rusqlite::params![src.to_string_lossy(), now()],
+    )?;
     Ok(dst_rel)
 }
 
@@ -198,21 +210,27 @@ pub struct ImportProgress {
     /// pliki bez duplikatu wykryte podczas skanu (jeszcze NIE skopiowane)
     pub new_files: u64,
     pub duplicates: u64,
+    /// pominięte, bo już zaimportowane wcześniej lub już w poczekalni
+    pub skipped: u64,
     pub errors: u64,
+    /// skan przerwany przez użytkownika (poczekalnia zachowuje dotychczasowe)
+    pub cancelled: bool,
 }
 
 /// Rdzeń importu — skanuje, liczy hash i wykrywa duplikaty, ale NIC nie kopiuje.
 /// Każdy plik (nowy lub duplikat) trafia do poczekalni `import_pending`; o tym,
 /// co ostatecznie ląduje w bibliotece, decyduje użytkownik przez `resolve_pending`.
+/// `cancel` pozwala przerwać w dowolnej chwili — już wczytane zostają w poczekalni.
 /// Bez zależności od Tauri, testowalny headless.
 pub fn run_core(
     conn: &Connection,
     source: &Path,
     photo_template: &str,
     video_template: &str,
+    cancel: &AtomicBool,
     mut on_progress: impl FnMut(&ImportProgress),
 ) -> ImportProgress {
-    let files = scan_source(source, photo_template, video_template);
+    let files = scan_source(source);
     let total = files.len() as u64;
 
     let mut progress = ImportProgress {
@@ -220,11 +238,39 @@ pub fn run_core(
         total,
         new_files: 0,
         duplicates: 0,
+        skipped: 0,
         errors: 0,
+        cancelled: false,
     };
 
     for f in files {
+        if cancel.load(Ordering::Relaxed) {
+            progress.cancelled = true;
+            break;
+        }
+        let src = f.abs.to_string_lossy().to_string();
+        // tani re-skan: już zaimportowane lub już w poczekalni pomijamy po ścieżce,
+        // bez EXIF i bez hasha — nie robimy 2x tej samej pracy
+        let seen: bool = conn
+            .query_row(
+                "SELECT 1 WHERE EXISTS (SELECT 1 FROM imported WHERE src = ?1)
+                            OR EXISTS (SELECT 1 FROM import_pending WHERE src = ?1)",
+                rusqlite::params![src],
+                |_| Ok(true),
+            )
+            .unwrap_or(false);
+        if seen {
+            progress.skipped += 1;
+            progress.done += 1;
+            if progress.done % 5 == 0 || progress.done == total {
+                on_progress(&progress);
+            }
+            continue;
+        }
         let result: anyhow::Result<()> = (|| {
+            let taken_at = taken_at_of(&f);
+            let template = if f.kind == 0 { photo_template } else { video_template };
+            let dst_dir = apply_template(template, taken_at, f.kind, &f.src_folder);
             let hash = hash_of(&f.abs, f.kind)?;
             let dup: Option<i64> = conn
                 .query_row(
@@ -239,15 +285,7 @@ pub fn run_core(
                 "INSERT OR IGNORE INTO import_pending
                  (src, dst, hash, dup_file_id, kind, size, created_at)
                  VALUES (?1,?2,?3,?4,?5,?6,?7)",
-                rusqlite::params![
-                    f.abs.to_string_lossy(),
-                    f.dst_dir,
-                    hash,
-                    dup,
-                    f.kind,
-                    f.size,
-                    now()
-                ],
+                rusqlite::params![src, dst_dir, hash, dup, f.kind, f.size, now()],
             )?;
             if dup.is_some() {
                 progress.duplicates += 1;
@@ -269,7 +307,13 @@ pub fn run_core(
 }
 
 /// Właściwy import — uruchamiany w wątku, raportuje eventami Tauri.
-pub fn run(app: AppHandle, source: PathBuf, photo_template: String, video_template: String) {
+pub fn run(
+    app: AppHandle,
+    source: PathBuf,
+    photo_template: String,
+    video_template: String,
+    cancel: Arc<AtomicBool>,
+) {
     let data_dir = app.path().app_data_dir().expect("app data dir");
     let conn = db::open(&data_dir).expect("import db");
     // biblioteka musi być ustawiona, żeby resolve_pending miał gdzie kopiować
@@ -277,9 +321,16 @@ pub fn run(app: AppHandle, source: PathBuf, photo_template: String, video_templa
         return;
     }
     let app2 = app.clone();
-    let progress = run_core(&conn, &source, &photo_template, &video_template, move |p| {
-        app2.emit("import-progress", p.clone()).ok();
-    });
+    let progress = run_core(
+        &conn,
+        &source,
+        &photo_template,
+        &video_template,
+        &cancel,
+        move |p| {
+            app2.emit("import-progress", p.clone()).ok();
+        },
+    );
     app.emit("import-done", progress).ok();
 }
 
@@ -418,10 +469,12 @@ mod tests {
         std::fs::write(source.join("new2.jpg"), b"nowe-22").unwrap();
         std::fs::write(source.join("dup.jpg"), &existing).unwrap();
 
-        let progress = run_core(&conn, &source, "{rok}/{miesiac}", "{rok}", |_| {});
+        let no_cancel = AtomicBool::new(false);
+        let progress = run_core(&conn, &source, "{rok}/{miesiac}", "{rok}", &no_cancel, |_| {});
         assert_eq!(progress.new_files, 2);
         assert_eq!(progress.duplicates, 1);
         assert_eq!(progress.errors, 0);
+        assert_eq!(progress.skipped, 0);
 
         // skan NIC nie kopiuje: wszystko czeka w poczekalni, biblioteka bez zmian
         let pending = list_pending(&conn);
@@ -448,11 +501,14 @@ mod tests {
         // źródło nietknięte
         assert!(source.join("dup.jpg").exists());
 
-        // ponowny import: wszystko to teraz duplikaty
-        let progress = run_core(&conn, &source, "{rok}/{miesiac}", "{rok}", |_| {});
+        // idempotencja: te same źródła są już zaimportowane → re-skan je pomija
+        // (bez ponownego hashowania, bez ponownego stage'owania)
+        let progress = run_core(&conn, &source, "{rok}/{miesiac}", "{rok}", &no_cancel, |_| {});
+        assert_eq!(progress.skipped, 3);
         assert_eq!(progress.new_files, 0);
-        assert_eq!(progress.duplicates, 3);
-        // "pomiń" czyści poczekalnię bez kopiowania
+        assert_eq!(progress.duplicates, 0);
+        assert!(list_pending(&conn).is_empty());
+        // "pomiń" na pustej poczekalni to no-op
         let ids: Vec<i64> = list_pending(&conn).iter().map(|p| p.id).collect();
         resolve_pending(&conn, &root, &ids, "skip").unwrap();
         assert!(list_pending(&conn).is_empty());

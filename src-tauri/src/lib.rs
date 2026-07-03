@@ -45,6 +45,8 @@ use tauri::{Emitter, Manager};
 
 pub struct AppState {
     pub db: Mutex<Connection>,
+    /// sygnał przerwania trwającego skanu importu (współdzielony z wątkiem importu)
+    pub import_cancel: Arc<std::sync::atomic::AtomicBool>,
 }
 
 #[derive(serde::Serialize)]
@@ -531,13 +533,24 @@ fn import_plan(
 #[tauri::command]
 fn import_run(
     app: tauri::AppHandle,
+    state: tauri::State<AppState>,
     source: String,
     photo_template: String,
     video_template: String,
 ) {
+    use std::sync::atomic::Ordering;
+    state.import_cancel.store(false, Ordering::SeqCst);
+    let cancel = state.import_cancel.clone();
     std::thread::spawn(move || {
-        import::run(app, source.into(), photo_template, video_template)
+        import::run(app, source.into(), photo_template, video_template, cancel)
     });
+}
+
+#[tauri::command]
+fn cancel_import(state: tauri::State<AppState>) {
+    state
+        .import_cancel
+        .store(true, std::sync::atomic::Ordering::SeqCst);
 }
 
 #[tauri::command]
@@ -1054,6 +1067,7 @@ pub fn run() {
             let conn = db::open(&data_dir)?;
             app.manage(AppState {
                 db: Mutex::new(conn),
+                import_cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             });
             app.manage(Arc::new(IndexerCtl::default()));
             app.manage(protected::SessionKeys::default());
@@ -1102,6 +1116,7 @@ pub fn run() {
             change_album_password,
             import_plan,
             import_run,
+            cancel_import,
             list_import_pending,
             resolve_import_pending,
             trash_files,

@@ -136,6 +136,12 @@ const MIGRATIONS: &[&str] = &[
         size        INTEGER NOT NULL,
         created_at  INTEGER NOT NULL
     );",
+    // v10 — rejestr ścieżek źródłowych już zaimportowanych; re-skan pomija je
+    // po ścieżce (bez ponownego hashowania), żeby nie robić 2x tej samej pracy
+    "CREATE TABLE imported (
+        src         TEXT PRIMARY KEY,
+        imported_at INTEGER NOT NULL
+    );",
 ];
 
 pub fn open(dir: &Path) -> anyhow::Result<Connection> {

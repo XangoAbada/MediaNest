@@ -18,7 +18,9 @@ interface ImportProgress {
   total: number;
   new_files: number;
   duplicates: number;
+  skipped: number;
   errors: number;
+  cancelled: boolean;
 }
 
 interface PendingItem {
@@ -297,6 +299,7 @@ export function ImportView() {
   const [finished, setFinished] = useState<ImportProgress | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [reviewing, setReviewing] = useState(false);
+  const [stopping, setStopping] = useState(false);
   const refresh = useLibrary((s) => s.refresh);
 
   const videoTpl = separate ? videoTemplate : photoTemplate;
@@ -414,7 +417,16 @@ export function ImportView() {
             disabled={planning || plan.total === 0}
             onClick={() => {
               setFinished(null);
-              setProgress({ done: 0, total: plan.total, new_files: 0, duplicates: 0, errors: 0 });
+              setStopping(false);
+              setProgress({
+                done: 0,
+                total: plan.total,
+                new_files: 0,
+                duplicates: 0,
+                skipped: 0,
+                errors: 0,
+                cancelled: false,
+              });
               invoke("import_run", { source, photoTemplate, videoTemplate: videoTpl });
             }}
             className="mt-4 rounded-md bg-accent px-5 py-2 text-sm font-medium text-white hover:bg-accent-hover disabled:opacity-50"
@@ -426,11 +438,23 @@ export function ImportView() {
 
       {progress && (
         <section className="mt-4 rounded-lg border border-edge bg-surface p-5">
-          <div className="mb-2 flex justify-between text-[13px]">
+          <div className="mb-2 flex items-center justify-between text-[13px]">
             <span>Skanowanie…</span>
-            <span className="text-ink-dim">
-              {progress.done} / {progress.total}
-            </span>
+            <div className="flex items-center gap-3">
+              <span className="text-ink-dim">
+                {progress.done} / {progress.total}
+              </span>
+              <button
+                disabled={stopping}
+                onClick={() => {
+                  setStopping(true);
+                  invoke("cancel_import");
+                }}
+                className="rounded-md border border-danger/40 px-3 py-1 text-[12px] text-danger hover:bg-danger/10 disabled:opacity-50"
+              >
+                {stopping ? "Zatrzymywanie…" : "Zatrzymaj"}
+              </button>
+            </div>
           </div>
           <div className="h-2 overflow-hidden rounded-full bg-raised">
             <div
@@ -441,6 +465,7 @@ export function ImportView() {
           <div className="mt-2 flex gap-4 text-[12px] text-ink-dim">
             <span>✓ {progress.new_files} nowych</span>
             <span>⧉ {progress.duplicates} duplikaty</span>
+            {progress.skipped > 0 && <span>⏭ {progress.skipped} pominięto</span>}
             {progress.errors > 0 && (
               <span className="text-danger">⚠ {progress.errors} błędy</span>
             )}
@@ -450,8 +475,10 @@ export function ImportView() {
 
       {finished && !progress && (
         <section className="mt-4 rounded-lg border border-success/30 bg-success/5 p-5 text-[13px]">
-          <b>Skan zakończony.</b> Nowych plików: {finished.new_files}, duplikatów:{" "}
-          {finished.duplicates}, błędów: {finished.errors}.
+          <b>{finished.cancelled ? "Skan zatrzymany." : "Skan zakończony."}</b> Nowych
+          plików: {finished.new_files}, duplikatów: {finished.duplicates}
+          {finished.skipped > 0 && <>, pominięto: {finished.skipped}</>}, błędów:{" "}
+          {finished.errors}.
           {finished.new_files + finished.duplicates > 0 && (
             <button
               onClick={() => setReviewing(true)}
