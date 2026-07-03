@@ -94,6 +94,7 @@ function PendingReview({ onDone }: { onDone: () => void }) {
   const [items, setItems] = useState<PendingItem[]>([]);
   const [selected, setSelected] = useState<Set<number>>(new Set());
   const [busy, setBusy] = useState(false);
+  const [tab, setTab] = useState<"new" | "dups">("new");
   const enqueueCopy = useApp((s) => s.enqueueCopy);
 
   // domyślnie zaznaczone są nowe pliki, duplikaty odznaczone
@@ -101,6 +102,8 @@ function PendingReview({ onDone }: { onDone: () => void }) {
     invoke<PendingItem[]>("list_import_pending").then((rows) => {
       setItems(rows);
       setSelected(new Set(rows.filter((r) => r.dup_id == null).map((r) => r.id)));
+      // otwórz zakładkę, która ma cokolwiek (np. sam import to duplikaty)
+      setTab(rows.some((r) => r.dup_id == null) ? "new" : "dups");
       if (rows.length === 0) onDone();
     });
   useEffect(() => {
@@ -156,6 +159,25 @@ function PendingReview({ onDone }: { onDone: () => void }) {
           biblioteki. „Usuń ze źródła" przenosi plik źródłowy do kosza systemowego.
         </p>
 
+        {/* zakładki: nowe pliki / duplikaty — nad paskiem akcji, poza sticky */}
+        <div className="mb-4 flex gap-1 border-b border-edge text-[13px]">
+          {([["new", `Do importu (${news.length})`], ["dups", `Duplikaty (${dups.length})`]] as const).map(
+            ([key, lbl]) => (
+              <button
+                key={key}
+                onClick={() => setTab(key)}
+                className={`-mb-px border-b-2 px-3 py-2 ${
+                  tab === key
+                    ? "border-accent font-medium text-ink"
+                    : "border-transparent text-ink-dim hover:text-ink"
+                }`}
+              >
+                {lbl}
+              </button>
+            )
+          )}
+        </div>
+
         {/* pasek akcji na zaznaczonych */}
         <div className="sticky top-0 z-10 mb-4 flex flex-wrap items-center gap-x-3 gap-y-2 rounded-lg border border-edge bg-surface/95 px-4 py-2.5 backdrop-blur">
           <span className="text-[13px] text-ink-dim">
@@ -196,7 +218,7 @@ function PendingReview({ onDone }: { onDone: () => void }) {
 
 
       {/* sekcja: nowe pliki (bez duplikatu) */}
-      {news.length > 0 && (
+      {tab === "new" && news.length > 0 && (
         <section className="mb-6">
           <div className="mb-2 flex items-center gap-3">
             <h3 className="text-[13px] font-semibold uppercase tracking-wide text-ink-dim">
@@ -256,7 +278,7 @@ function PendingReview({ onDone }: { onDone: () => void }) {
       )}
 
       {/* sekcja: duplikaty (identyczna treść już w bibliotece) */}
-      {dups.length > 0 && (
+      {tab === "dups" && dups.length > 0 && (
         <section>
           <h3 className="mb-2 text-[13px] font-semibold uppercase tracking-wide text-ink-dim">
             Duplikaty ({dups.length}) — identyczna treść już w bibliotece
@@ -323,6 +345,13 @@ function PendingReview({ onDone }: { onDone: () => void }) {
             ))}
           </div>
         </section>
+      )}
+
+      {tab === "new" && news.length === 0 && (
+        <p className="text-[13px] text-ink-dim">Brak nowych plików do importu.</p>
+      )}
+      {tab === "dups" && dups.length === 0 && (
+        <p className="text-[13px] text-ink-dim">Brak duplikatów.</p>
       )}
       </div>
     </div>
