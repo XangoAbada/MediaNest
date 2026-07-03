@@ -718,6 +718,79 @@ fn mime_for(path: &str) -> &'static str {
     }
 }
 
+/// Zwraca URL (ścieżkę dla protokołu `media`) do odtworzenia wideo w Lightboxie.
+/// Grywalny plik (mp4/mov H.264) → `"<id>"` (oryginał, zero kosztu). Niegrywalny
+/// (AVI/WMV/MTS/MKV/HEVC…) → transkoduje raz do H.264/AAC mp4 w cache i zwraca
+/// `"transcode/<hash>"`. Postęp transkodowania emitowany jako `transcode-progress`.
+#[tauri::command]
+async fn prepare_video(app: tauri::AppHandle, id: i64) -> Result<String, String> {
+    let (abs, protected, hash_hex, data_dir) = {
+        let root = {
+            let state = app.state::<AppState>();
+            let conn = state.db.lock().unwrap();
+            db::get_setting(&conn, "library_path").ok_or("brak library_path")?
+        };
+        let state = app.state::<AppState>();
+        let conn = state.db.lock().unwrap();
+        let (rel, album, hash_hex): (String, Option<i64>, Option<String>) = conn
+            .query_row(
+                "SELECT path, protected_album, lower(hex(hash)) FROM files WHERE id = ?1",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .map_err(|e| e.to_string())?;
+        let data_dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+        (
+            PathBuf::from(root).join(rel),
+            album.is_some(),
+            hash_hex.unwrap_or_default(),
+            data_dir,
+        )
+    };
+
+    // ponytail: pliki chronione serwujemy jak dziś (deszyfrowanie w locie przez
+    // media://<id>); plaintext mp4 w cache złamałby szyfrowanie. Chroniony
+    // niegrywalny kodek pozostaje nieodtwarzalny — rzadki przypadek.
+    if protected {
+        return Ok(id.to_string());
+    }
+
+    let app2 = app.clone();
+    tauri::async_runtime::spawn_blocking(move || -> Result<String, String> {
+        if video::web_playable(&abs) {
+            return Ok(id.to_string());
+        }
+        if hash_hex.len() < 2 {
+            return Err("brak hasha pliku".into());
+        }
+        let cache = data_dir
+            .join("thumbs")
+            .join(&hash_hex[..2])
+            .join(format!("{hash_hex}.mp4"));
+        if !cache.exists() {
+            // ponytail: globalny lock serializuje transkodowania — jeden na raz.
+            // Chroni przed wyścigiem na wspólnym pliku .part (StrictMode woła
+            // prepare_video podwójnie) i przed thrashem CPU/GPU. Per-plik lock,
+            // gdyby równoległość kiedyś była potrzebna.
+            let _guard = TRANSCODE_LOCK.lock().unwrap();
+            if !cache.exists() {
+                let dur = video::probe(&abs).ok().and_then(|m| m.duration);
+                let ok = video::transcode_web(&abs, &cache, dur, |pct| {
+                    let _ = app2.emit("transcode-progress", (id, pct));
+                });
+                if !ok {
+                    return Err("transkodowanie nie powiodło się".into());
+                }
+            }
+        }
+        Ok(format!("transcode/{hash_hex}"))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+static TRANSCODE_LOCK: Mutex<()> = Mutex::new(());
+
 /// Serwuje oryginalne pliki przez media://<id> z obsługą Range —
 /// wymagane do przewijania wideo; chunk ograniczony do 8 MB pamięci.
 fn serve_media(
@@ -732,9 +805,28 @@ fn serve_media(
             .body(Vec::new())
             .unwrap()
     };
-    let url_path = request.uri().path().trim_start_matches('/').to_string();
+    // WebView2 koduje ukośnik w ścieżce jako %2F — dekodujemy, by dopasować
+    // prefiksy transcode/ i pending/ (hash i id nie mają innych znaków specjalnych).
+    let url_path = request
+        .uri()
+        .path()
+        .trim_start_matches('/')
+        .replace("%2F", "/")
+        .replace("%2f", "/");
     let mut protected_key: Option<crypto::Key> = None;
-    let abs = {
+    let abs = if let Some(hash) = url_path.strip_prefix("transcode/") {
+        // media://transcode/<hash> — przetranskodowany plik z cache (H.264/AAC mp4)
+        if hash.len() < 2 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return not_found();
+        }
+        let Ok(data_dir) = app.path().app_data_dir() else {
+            return not_found();
+        };
+        data_dir
+            .join("thumbs")
+            .join(&hash[..2])
+            .join(format!("{hash}.mp4"))
+    } else {
         let state = app.state::<AppState>();
         let conn = state.db.lock().unwrap();
         // media://pending/<id> — podgląd pliku źródłowego z poczekalni importu
@@ -981,6 +1073,7 @@ pub fn run() {
             count_files,
             list_files,
             get_file_info,
+            prepare_video,
             list_folders,
             set_focus_folder,
             rescan,

@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import {
   useLibrary,
   formatDuration,
@@ -116,6 +117,9 @@ export function Lightbox() {
   const [moving, setMoving] = useState(false);
   const [slideshow, setSlideshow] = useState(false);
   const [uiVisible, setUiVisible] = useState(true);
+  // wideo: URL gotowy do odtwarzania (po ew. transkodowaniu) + postęp (0–1, -1 = błąd)
+  const [videoSrc, setVideoSrc] = useState<string | null>(null);
+  const [videoProgress, setVideoProgress] = useState<number | null>(null);
   const uiTimer = useRef<number>(0);
   const dragRef = useRef<{ x: number; y: number } | null>(null);
   const rootRef = useRef<HTMLDivElement>(null);
@@ -132,6 +136,30 @@ export function Lightbox() {
     setZoom(1);
     setPan({ x: 0, y: 0 });
   }, [index]);
+
+  // przygotowanie wideo: backend decyduje czy serwować oryginał, czy transkodować
+  useEffect(() => {
+    if (!item || item.kind !== 1) {
+      setVideoSrc(null);
+      setVideoProgress(null);
+      return;
+    }
+    const vid = item.id;
+    setVideoSrc(null);
+    setVideoProgress(null);
+    let cancelled = false;
+    let unlisten: (() => void) | undefined;
+    listen<[number, number]>("transcode-progress", (e) => {
+      if (e.payload[0] === vid) setVideoProgress(e.payload[1]);
+    }).then((u) => (cancelled ? u() : (unlisten = u)));
+    invoke<string>("prepare_video", { id: vid })
+      .then((ret) => !cancelled && setVideoSrc(convertFileSrc(ret, "media")))
+      .catch(() => !cancelled && setVideoProgress(-1));
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
+  }, [item?.id, item?.kind]);
 
   // preload pełnych zdjęć sąsiadów — strzałki działają bez czekania
   useEffect(() => {
@@ -164,6 +192,18 @@ export function Lightbox() {
     uiTimer.current = window.setTimeout(() => setUiVisible(false), 2000);
   }, []);
 
+  // pełny ekran (przycisk, klawisz F, dwuklik) + synchronizacja ikony
+  const [isFs, setIsFs] = useState(false);
+  const toggleFs = useCallback(() => {
+    if (document.fullscreenElement) document.exitFullscreen();
+    else rootRef.current?.requestFullscreen();
+  }, []);
+  useEffect(() => {
+    const onFs = () => setIsFs(!!document.fullscreenElement);
+    document.addEventListener("fullscreenchange", onFs);
+    return () => document.removeEventListener("fullscreenchange", onFs);
+  }, []);
+
   // skróty klawiszowe
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -189,8 +229,7 @@ export function Lightbox() {
           break;
         case "f":
         case "F":
-          if (document.fullscreenElement) document.exitFullscreen();
-          else rootRef.current?.requestFullscreen();
+          toggleFs();
           break;
         case "s":
         case "S":
@@ -227,7 +266,7 @@ export function Lightbox() {
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [prev, next, closeLightbox, moving]);
+  }, [prev, next, closeLightbox, moving, toggleFs]);
 
   if (!item) {
     return <div className="fixed inset-0 z-50 bg-black" onClick={closeLightbox} />;
@@ -264,18 +303,42 @@ export function Lightbox() {
           }}
           onPointerUp={() => (dragRef.current = null)}
           onDoubleClick={() => {
-            setZoom(1);
-            setPan({ x: 0, y: 0 });
+            if (zoom > 1) {
+              setZoom(1);
+              setPan({ x: 0, y: 0 });
+            } else {
+              toggleFs();
+            }
           }}
         >
           {isVideo ? (
-            <video
-              key={item.id}
-              src={src}
-              controls
-              autoPlay
-              className="absolute inset-0 h-full w-full"
-            />
+            videoSrc ? (
+              <video
+                key={item.id}
+                src={videoSrc}
+                controls
+                autoPlay
+                className="absolute inset-0 h-full w-full"
+              />
+            ) : (
+              <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 text-white/80">
+                <div className="text-sm">
+                  {videoProgress === -1
+                    ? "Nie udało się przygotować wideo"
+                    : videoProgress != null
+                      ? `Przygotowywanie wideo… ${Math.round(videoProgress * 100)}%`
+                      : "Przygotowywanie wideo…"}
+                </div>
+                {videoProgress != null && videoProgress >= 0 && (
+                  <div className="h-1 w-48 overflow-hidden rounded-full bg-white/20">
+                    <div
+                      className="h-full bg-accent transition-[width] duration-200"
+                      style={{ width: `${Math.round(videoProgress * 100)}%` }}
+                    />
+                  </div>
+                )}
+              </div>
+            )
           ) : (
             // bez key: przy zmianie src przeglądarka trzyma poprzednią bitmapę
             // do czasu zdekodowania nowej — zero czarnego mrugnięcia
@@ -319,6 +382,13 @@ export function Lightbox() {
                   title="Przenieś do folderu (M)"
                 >
                   🗀 Przenieś
+                </button>
+                <button
+                  onClick={toggleFs}
+                  className="text-white/70 hover:text-white"
+                  title="Pełny ekran (F)"
+                >
+                  {isFs ? "🡼 Zamknij" : "⛶ Pełny ekran"}
                 </button>
                 <button
                   onClick={() => setShowInfo((v) => !v)}

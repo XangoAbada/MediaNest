@@ -39,14 +39,18 @@ pub struct VideoMeta {
     pub duration: Option<f64>,
     pub width: Option<u32>,
     pub height: Option<u32>,
+    /// Kodek pierwszego strumienia wideo, np. `h264`, `hevc` — do decyzji, czy
+    /// WebView2 odtworzy plik bezpośrednio.
+    pub codec: Option<String>,
 }
 
-/// Czyta nagłówek pliku: czas trwania i wymiary. Dekoduje tylko 1 klatkę.
+/// Czyta nagłówek pliku: czas trwania, wymiary i kodek. Dekoduje tylko 1 klatkę.
 pub fn probe(path: &Path) -> anyhow::Result<VideoMeta> {
     let mut meta = VideoMeta {
         duration: None,
         width: None,
         height: None,
+        codec: None,
     };
     let mut child = FfmpegCommand::new()
         .input(path.to_string_lossy())
@@ -59,12 +63,96 @@ pub fn probe(path: &Path) -> anyhow::Result<VideoMeta> {
                 if let Some(v) = stream.video_data() {
                     meta.width = Some(v.width);
                     meta.height = Some(v.height);
+                    if meta.codec.is_none() {
+                        meta.codec = Some(stream.format.clone());
+                    }
                 }
             }
             _ => {}
         }
     }
     Ok(meta)
+}
+
+/// Czy WebView2 odtworzy plik bezpośrednio: kontener mp4/mov/m4v z kodekiem
+/// H.264. Wszystko inne (AVI/WMV/MTS/MKV/3GP, HEVC) wymaga transkodowania.
+pub fn web_playable(path: &Path) -> bool {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if !matches!(ext.as_str(), "mp4" | "m4v" | "mov") {
+        return false;
+    }
+    matches!(
+        probe(path).ok().and_then(|m| m.codec).as_deref(),
+        Some("h264")
+    )
+}
+
+/// Parsuje `HH:MM:SS.ms` z postępu ffmpeg na sekundy.
+fn parse_hms(t: &str) -> Option<f64> {
+    let mut parts = t.split(':');
+    let h: f64 = parts.next()?.parse().ok()?;
+    let m: f64 = parts.next()?.parse().ok()?;
+    let s: f64 = parts.next()?.parse().ok()?;
+    Some(h * 3600.0 + m * 60.0 + s)
+}
+
+/// Transkoduje do H.264/AAC MP4 z faststart (moov na początku → szybki start
+/// i seek przez Range). Próba NVENC, fallback na libx264. `on_progress` dostaje
+/// postęp 0.0–1.0 wyliczony z czasu przetworzonego / czasu trwania.
+pub fn transcode_web(src: &Path, out: &Path, duration: Option<f64>, on_progress: impl Fn(f64)) -> bool {
+    std::fs::create_dir_all(out.parent().unwrap()).ok();
+    let cuda = HAS_CUDA.load(Ordering::Relaxed);
+    let input = src.to_string_lossy().to_string();
+    let tmp = out.with_extension("mp4.part");
+    for use_cuda in [cuda, false] {
+        let mut cmd = FfmpegCommand::new();
+        if use_cuda {
+            cmd.args(["-hwaccel", "cuda"]);
+        }
+        cmd.input(&input);
+        if use_cuda {
+            cmd.args(["-c:v", "h264_nvenc"]);
+        } else {
+            cmd.args(["-c:v", "libx264", "-preset", "veryfast", "-crf", "23"]);
+        }
+        // -f mp4: nazwa tmp (.part) nie wskazuje muxera, wymuszamy jawnie
+        cmd.args(["-c:a", "aac", "-movflags", "+faststart", "-f", "mp4", "-y"])
+            .output(tmp.to_string_lossy());
+        let mut success = false;
+        if let Ok(mut child) = cmd.spawn() {
+            if let Ok(iter) = child.iter() {
+                for event in iter {
+                    if let FfmpegEvent::Progress(p) = event {
+                        if let (Some(d), Some(t)) = (duration, parse_hms(&p.time)) {
+                            if d > 0.0 {
+                                on_progress((t / d).clamp(0.0, 1.0));
+                            }
+                        }
+                    }
+                }
+            }
+            success = child.wait().map(|s| s.success()).unwrap_or(false);
+        }
+        // akceptuj tylko przy sukcesie ffmpeg i niepustym pliku — NVENC/NVDEC
+        // potrafi zwrócić błąd zostawiając pusty plik; wtedy fallback na CPU
+        let nonempty = tmp.metadata().map(|m| m.len() > 0).unwrap_or(false);
+        if success && nonempty {
+            // atomowy commit: częściowy plik nigdy nie trafia do cache jako gotowy
+            if std::fs::rename(&tmp, out).is_ok() {
+                on_progress(1.0);
+                return true;
+            }
+        }
+        std::fs::remove_file(&tmp).ok(); // sprzątaj przed fallbackiem / wyjściem
+        if !use_cuda {
+            break;
+        }
+    }
+    false
 }
 
 fn run_to_file(build: impl Fn(&mut FfmpegCommand), out: &Path) -> bool {
@@ -150,6 +238,12 @@ mod tests {
         assert!(sprite(&vid, dur, &spr));
         let img = image::open(&spr).unwrap();
         assert_eq!(img.width(), 1600); // 10 klatek × 160 px
+
+        // mp4/h264 jest grywalny bez transkodowania; transkode i tak daje h264 mp4
+        assert!(web_playable(&vid));
+        let web = dir.join("web.mp4");
+        assert!(transcode_web(&vid, &web, Some(dur), |_| {}));
+        assert_eq!(probe(&web).unwrap().codec.as_deref(), Some("h264"));
     }
 }
 
