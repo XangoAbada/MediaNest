@@ -94,6 +94,7 @@ function PendingReview({ onDone }: { onDone: () => void }) {
   const [items, setItems] = useState<PendingItem[]>([]);
   const [selected, setSelected] = useState<Set<number>>(new Set());
   const [busy, setBusy] = useState(false);
+  const enqueueCopy = useApp((s) => s.enqueueCopy);
 
   // domyślnie zaznaczone są nowe pliki, duplikaty odznaczone
   const load = () =>
@@ -106,6 +107,15 @@ function PendingReview({ onDone }: { onDone: () => void }) {
     load();
   }, []);
 
+  // kopiowanie trafia do GLOBALNEJ kolejki (panel widoczny w każdym widoku) —
+  // po dodaniu opuszczamy przegląd, by można było przygotować kolejny import
+  function addToLibrary(ids: number[]) {
+    if (ids.length === 0) return;
+    enqueueCopy(ids, `${ids.length} plików`);
+    onDone();
+  }
+
+  // szybkie akcje (pomiń / usuń ze źródła) — synchronicznie, lokalnie
   async function resolve(ids: number[], action: string) {
     if (ids.length === 0) return;
     setBusy(true);
@@ -134,45 +144,56 @@ function PendingReview({ onDone }: { onDone: () => void }) {
   const news = items.filter((i) => i.dup_id == null);
   const dups = items.filter((i) => i.dup_id != null);
   const selIds = [...selected].filter((id) => items.some((i) => i.id === id));
+  const allIds = items.map((i) => i.id);
   const newAllOn = news.length > 0 && news.every((i) => selected.has(i.id));
 
   return (
-    <div className="mx-auto max-w-4xl p-6">
-      <h2 className="text-lg font-semibold">Przegląd importu ({items.length})</h2>
-      <p className="mt-1 mb-4 text-[13px] text-ink-dim">
-        Nic nie zostało jeszcze skopiowane. Zaznacz pliki, które mają trafić do
-        biblioteki. „Usuń ze źródła" przenosi plik źródłowy do kosza systemowego.
-      </p>
+    <div className="h-full overflow-y-auto">
+      <div className="mx-auto max-w-4xl p-6">
+        <h2 className="text-lg font-semibold">Przegląd importu ({items.length})</h2>
+        <p className="mt-1 mb-4 text-[13px] text-ink-dim">
+          Nic nie zostało jeszcze skopiowane. Zaznacz pliki, które mają trafić do
+          biblioteki. „Usuń ze źródła" przenosi plik źródłowy do kosza systemowego.
+        </p>
 
-      {/* pasek akcji na zaznaczonych */}
-      <div className="sticky top-0 z-10 mb-4 flex items-center gap-3 rounded-lg border border-edge bg-surface/95 px-4 py-2.5 backdrop-blur">
-        <span className="text-[13px] text-ink-dim">
-          Zaznaczono <b className="text-ink">{selIds.length}</b> z {items.length}
-        </span>
-        <div className="ml-auto flex gap-2 text-[13px]">
-          <button
-            disabled={busy || selIds.length === 0}
-            onClick={() => resolve(selIds, "import")}
-            className="rounded-md bg-accent px-3 py-1.5 font-medium text-white hover:bg-accent-hover disabled:opacity-50"
-          >
-            Dodaj zaznaczone do biblioteki
-          </button>
-          <button
-            disabled={busy || selIds.length === 0}
-            onClick={() => resolve(selIds, "skip")}
-            className="rounded-md border border-edge bg-raised px-3 py-1.5 hover:border-ink-faint disabled:opacity-50"
-          >
-            Pomiń zaznaczone
-          </button>
-          <button
-            disabled={busy || selIds.length === 0}
-            onClick={() => resolve(selIds, "delete_source")}
-            className="rounded-md border border-danger/40 px-3 py-1.5 text-danger hover:bg-danger/10 disabled:opacity-50"
-          >
-            Usuń zaznaczone ze źródła
-          </button>
+        {/* pasek akcji na zaznaczonych */}
+        <div className="sticky top-0 z-10 mb-4 flex flex-wrap items-center gap-x-3 gap-y-2 rounded-lg border border-edge bg-surface/95 px-4 py-2.5 backdrop-blur">
+          <span className="text-[13px] text-ink-dim">
+            Zaznaczono <b className="text-ink">{selIds.length}</b> z {items.length}
+          </span>
+          <div className="ml-auto flex flex-wrap gap-2 text-[13px]">
+            <button
+              disabled={busy || selIds.length === 0}
+              onClick={() => addToLibrary(selIds)}
+              className="rounded-md bg-accent px-3 py-1.5 font-medium text-white hover:bg-accent-hover disabled:opacity-50"
+            >
+              Dodaj zaznaczone do biblioteki
+            </button>
+            <button
+              disabled={busy || selIds.length === 0}
+              onClick={() => resolve(selIds, "skip")}
+              className="rounded-md border border-edge bg-raised px-3 py-1.5 hover:border-ink-faint disabled:opacity-50"
+            >
+              Pomiń zaznaczone
+            </button>
+            <button
+              disabled={busy || selIds.length === 0}
+              onClick={() => resolve(selIds, "delete_source")}
+              className="rounded-md border border-danger/40 px-3 py-1.5 text-danger hover:bg-danger/10 disabled:opacity-50"
+            >
+              Usuń zaznaczone ze źródła
+            </button>
+            <button
+              disabled={busy}
+              onClick={() => resolve(allIds, "skip")}
+              title="Usuwa całą listę z poczekalni (plików nie kopiuje ani nie kasuje)"
+              className="rounded-md border border-edge px-3 py-1.5 text-ink-dim hover:border-ink-faint disabled:opacity-50"
+            >
+              Wyczyść poczekalnię
+            </button>
+          </div>
         </div>
-      </div>
+
 
       {/* sekcja: nowe pliki (bez duplikatu) */}
       {news.length > 0 && (
@@ -204,12 +225,24 @@ function PendingReview({ onDone }: { onDone: () => void }) {
                   onChange={() => toggle(item.id)}
                   className="absolute left-1.5 top-1.5 z-10 accent-(--color-accent)"
                 />
-                <img
-                  src={convertFileSrc(`pending/${item.id}`, "media")}
-                  className={`h-28 w-full object-cover transition-opacity ${
-                    selected.has(item.id) ? "" : "opacity-40"
-                  }`}
-                />
+                {item.kind === 1 ? (
+                  <div
+                    className={`flex h-28 w-full items-center justify-center bg-raised text-2xl transition-opacity ${
+                      selected.has(item.id) ? "" : "opacity-40"
+                    }`}
+                  >
+                    🎬
+                  </div>
+                ) : (
+                  <img
+                    src={convertFileSrc(`pending/${item.id}`, "media")}
+                    loading="lazy"
+                    decoding="async"
+                    className={`h-28 w-full object-cover transition-opacity ${
+                      selected.has(item.id) ? "" : "opacity-40"
+                    }`}
+                  />
+                )}
                 <div
                   className="truncate px-2 py-1 font-mono text-[10px] text-ink-dim"
                   title={item.src}
@@ -242,10 +275,18 @@ function PendingReview({ onDone }: { onDone: () => void }) {
                 />
                 <div className="flex gap-2">
                   <figure className="w-28 text-center">
-                    <img
-                      src={convertFileSrc(`pending/${item.id}`, "media")}
-                      className="h-24 w-28 rounded-[4px] object-cover"
-                    />
+                    {item.kind === 1 ? (
+                      <div className="flex h-24 w-28 items-center justify-center rounded-[4px] bg-raised text-2xl opacity-40">
+                        🎬
+                      </div>
+                    ) : (
+                      <img
+                        src={convertFileSrc(`pending/${item.id}`, "media")}
+                        loading="lazy"
+                        decoding="async"
+                        className="h-24 w-28 rounded-[4px] object-cover"
+                      />
+                    )}
                     <figcaption className="mt-1 text-[10px] uppercase tracking-wide text-ink-faint">
                       Nowy
                     </figcaption>
@@ -283,6 +324,7 @@ function PendingReview({ onDone }: { onDone: () => void }) {
           </div>
         </section>
       )}
+      </div>
     </div>
   );
 }
@@ -300,9 +342,18 @@ export function ImportView() {
   const [error, setError] = useState<string | null>(null);
   const [reviewing, setReviewing] = useState(false);
   const [stopping, setStopping] = useState(false);
+  const [pendingCount, setPendingCount] = useState(0);
   const refresh = useLibrary((s) => s.refresh);
 
   const videoTpl = separate ? videoTemplate : photoTemplate;
+
+  // poczekalnia bywa niepusta z poprzedniego (być może przerwanego) skanu —
+  // pokazujemy do niej wejście, żeby wczytane pliki nie zostały „uwięzione"
+  useEffect(() => {
+    if (!reviewing) {
+      invoke<PendingItem[]>("list_import_pending").then((r) => setPendingCount(r.length));
+    }
+  }, [reviewing]);
 
   useEffect(() => {
     const un1 = listen<ImportProgress>("import-progress", (e) => setProgress(e.payload));
@@ -342,13 +393,28 @@ export function ImportView() {
   }
 
   return (
-    <div className="mx-auto max-w-2xl p-6">
+    <div className="h-full overflow-y-auto">
+      <div className="mx-auto max-w-2xl p-6">
       <h2 className="text-lg font-semibold tracking-tight">Import plików</h2>
       <p className="mt-1 text-[13px] text-ink-dim">
         Skanuje zdjęcia i filmy oraz wykrywa duplikaty, ale nic nie kopiuje — po
         skanie wybierasz zaznaczeniem, co trafi do biblioteki. Wybrane pliki są
         układane według schematu i weryfikowane hashem po skopiowaniu.
       </p>
+
+      {pendingCount > 0 && !progress && (
+        <div className="mt-4 flex items-center gap-3 rounded-lg border border-accent/40 bg-accent/5 px-4 py-3 text-[13px]">
+          <span>
+            W poczekalni czeka <b>{pendingCount}</b> wczytanych plików na decyzję.
+          </span>
+          <button
+            onClick={() => setReviewing(true)}
+            className="ml-auto shrink-0 rounded-md bg-accent px-3 py-1 text-white hover:bg-accent-hover"
+          >
+            Przejrzyj poczekalnię
+          </button>
+        </div>
+      )}
 
       <section className="mt-5 space-y-4 rounded-lg border border-edge bg-surface p-5">
         <div className="flex items-center gap-3">
@@ -489,6 +555,7 @@ export function ImportView() {
           )}
         </section>
       )}
+      </div>
     </div>
   );
 }

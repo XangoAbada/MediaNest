@@ -440,6 +440,19 @@ fn apply_orientation(img: DynamicImage, orientation: u32) -> DynamicImage {
     }
 }
 
+/// Miniaturka WebP w locie z pliku obrazu — dla podglądu poczekalni importu,
+/// gdzie plik nie jest jeszcze zaindeksowany (brak zapisanej miniaturki).
+/// Zwraca małe bajty (nie cały oryginał!), więc siatka setek pozycji nie zjada
+/// pamięci. `None` dla nie-obrazów / błędu dekodowania.
+pub fn thumb_bytes(path: &Path) -> Option<Vec<u8>> {
+    let img = image::open(path).ok()?;
+    let (orientation, _) = read_exif(path);
+    let thumb = apply_orientation(img, orientation).thumbnail(THUMB_SIZE, THUMB_SIZE);
+    let rgb = thumb.to_rgb8();
+    let encoded = webp::Encoder::from_rgb(&rgb, rgb.width(), rgb.height()).encode(80.0);
+    Some(encoded.to_vec())
+}
+
 fn write_thumb(thumbs_dir: &Path, hash_hex: &str, thumb: &DynamicImage) -> anyhow::Result<()> {
     let path = thumb_path(thumbs_dir, hash_hex);
     if path.exists() {

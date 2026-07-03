@@ -96,6 +96,42 @@ function Toasts() {
   );
 }
 
+/** Globalny panel postępu kopiowania do biblioteki + kolejka oczekujących. */
+function CopyQueue() {
+  const { copyActive, copyQueue } = useApp();
+  if (!copyActive) return null;
+  const pct = Math.round((100 * copyActive.done) / Math.max(1, copyActive.total));
+  return (
+    <div className="fixed bottom-4 left-4 z-[60] w-80 rounded-lg border border-edge bg-raised p-4 shadow-lg">
+      <div className="mb-2 flex justify-between text-[13px]">
+        <span className="font-medium">Kopiowanie do biblioteki</span>
+        <span className="text-ink-dim">
+          {copyActive.done} / {copyActive.total}
+        </span>
+      </div>
+      <div className="h-2 overflow-hidden rounded-full bg-app">
+        <div
+          className="h-full bg-accent transition-[width] duration-300"
+          style={{ width: `${pct}%` }}
+        />
+      </div>
+      <div className="mt-2 flex justify-between text-[12px] text-ink-dim">
+        <span className="truncate">{copyActive.label}</span>
+        {copyActive.errors > 0 && (
+          <span className="shrink-0 text-danger">⚠ {copyActive.errors}</span>
+        )}
+      </div>
+      {copyQueue.length > 0 && (
+        <div className="mt-2 border-t border-edge pt-2 text-[12px] text-ink-faint">
+          W kolejce: {copyQueue.length}
+          {copyQueue.reduce((n, j) => n + j.ids.length, 0) > 0 &&
+            ` (${copyQueue.reduce((n, j) => n + j.ids.length, 0)} plików)`}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function NavButton({
   item,
   active,
@@ -338,6 +374,12 @@ export function AppShell() {
       },
     );
     const unChanged = listen("library-changed", () => refresh());
+    // globalna kolejka kopiowania — postęp aktualizuje store niezależnie od widoku
+    const unCopyProg = listen<{ done: number; total: number; ok: number; errors: number }>(
+      "resolve-progress",
+      (e) => useApp.getState().copyProgress(e.payload),
+    );
+    const unCopyDone = listen("resolve-done", () => useApp.getState().copyDone());
     const unDrive = listen<string>("drive-added", (event) => {
       toast(`Wykryto nośnik ${event.payload}`, {
         label: "Importuj",
@@ -350,6 +392,8 @@ export function AppShell() {
     return () => {
       unProgress.then((fn) => fn());
       unChanged.then((fn) => fn());
+      unCopyProg.then((fn) => fn());
+      unCopyDone.then((fn) => fn());
       unDrive.then((fn) => fn());
     };
   }, [refresh, setIndexing, toast, setImportSource]);
@@ -447,6 +491,7 @@ export function AppShell() {
       {lightbox !== null && <Lightbox />}
       <PasswordPrompt />
       <Toasts />
+      <CopyQueue />
     </div>
   );
 }

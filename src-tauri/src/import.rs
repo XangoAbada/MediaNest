@@ -195,10 +195,11 @@ fn copy_verified(
         "INSERT INTO operation_items (op_id, src, dst) VALUES (?1, ?2, ?3)",
         rusqlite::params![op_id, src.to_string_lossy(), dst_rel],
     )?;
-    // rejestr źródła — re-skan tego samego folderu pomija je bez hashowania
+    // rejestr źródła + celu — re-skan pomija je bez hashowania, ale weryfikuje,
+    // że plik docelowy nadal istnieje (patrz run_core)
     conn.execute(
-        "INSERT OR IGNORE INTO imported (src, imported_at) VALUES (?1, ?2)",
-        rusqlite::params![src.to_string_lossy(), now()],
+        "INSERT OR IGNORE INTO imported (src, dst, imported_at) VALUES (?1, ?2, ?3)",
+        rusqlite::params![src.to_string_lossy(), dst_rel, now()],
     )?;
     Ok(dst_rel)
 }
@@ -249,12 +250,16 @@ pub fn run_core(
             break;
         }
         let src = f.abs.to_string_lossy().to_string();
-        // tani re-skan: już zaimportowane lub już w poczekalni pomijamy po ścieżce,
-        // bez EXIF i bez hasha — nie robimy 2x tej samej pracy
+        // tani re-skan: już w poczekalni, albo już zaimportowane I nadal obecne w
+        // bibliotece → pomijamy po ścieżce, bez EXIF i bez hasha. Weryfikacja
+        // istnienia pliku docelowego: jeśli został usunięty, pozwalamy importować
+        // ponownie (nie ufamy ślepo rekordowi w `imported`).
         let seen: bool = conn
             .query_row(
-                "SELECT 1 WHERE EXISTS (SELECT 1 FROM imported WHERE src = ?1)
-                            OR EXISTS (SELECT 1 FROM import_pending WHERE src = ?1)",
+                "SELECT 1 WHERE
+                   EXISTS (SELECT 1 FROM import_pending WHERE src = ?1)
+                   OR EXISTS (SELECT 1 FROM imported i JOIN files f
+                              ON f.path = i.dst AND f.status = 0 WHERE i.src = ?1)",
                 rusqlite::params![src],
                 |_| Ok(true),
             )
@@ -379,22 +384,39 @@ pub fn list_pending(conn: &Connection) -> Vec<PendingItem> {
     .unwrap_or_default()
 }
 
+#[derive(serde::Serialize, Clone)]
+pub struct ResolveProgress {
+    pub done: u64,
+    pub total: u64,
+    pub ok: u64,
+    pub errors: u64,
+}
+
 /// Rozstrzyga pozycje poczekalni: "import" | "skip" | "delete_source".
+/// Kopiowanie dużych plików trwa — raportuje postęp przez `on_progress`, a błąd
+/// pojedynczego pliku nie przerywa całości (wiersz zostaje, można ponowić).
 pub fn resolve_pending(
     conn: &Connection,
     root: &Path,
     ids: &[i64],
     action: &str,
-) -> Result<(), String> {
+    mut on_progress: impl FnMut(&ResolveProgress),
+) -> ResolveProgress {
     let op_id = if action == "import" {
         conn.execute(
             "INSERT INTO operations (kind, label, created_at) VALUES ('import', 'poczekalnia', ?1)",
             rusqlite::params![now()],
         )
-        .map_err(|e| e.to_string())?;
+        .ok();
         conn.last_insert_rowid()
     } else {
         0
+    };
+    let mut progress = ResolveProgress {
+        done: 0,
+        total: ids.len() as u64,
+        ok: 0,
+        errors: 0,
     };
     for id in ids {
         let row: Option<(String, String, Vec<u8>, i64)> = conn
@@ -404,24 +426,30 @@ pub fn resolve_pending(
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
             )
             .ok();
-        let Some((src, dst, hash, kind)) = row else {
-            continue;
-        };
-        match action {
-            "import" => {
-                copy_verified(conn, root, Path::new(&src), kind, &hash, &dst, op_id)
-                    .map_err(|e| e.to_string())?;
-            }
-            "delete_source" => {
+        if let Some((src, dst, hash, kind)) = row {
+            let outcome: Result<(), String> = match action {
+                "import" => copy_verified(conn, root, Path::new(&src), kind, &hash, &dst, op_id)
+                    .map(|_| ())
+                    .map_err(|e| e.to_string()),
                 // do systemowego kosza — źródło może być cenne
-                trash::delete(&src).map_err(|e| e.to_string())?;
+                "delete_source" => trash::delete(&src).map_err(|e| e.to_string()),
+                _ => Ok(()), // skip — tylko usunięcie z poczekalni
+            };
+            match outcome {
+                Ok(()) => {
+                    conn.execute("DELETE FROM import_pending WHERE id = ?1", [id]).ok();
+                    progress.ok += 1;
+                }
+                Err(e) => {
+                    eprintln!("resolve {action} error {src}: {e}");
+                    progress.errors += 1; // wiersz zostaje w poczekalni do ponowienia
+                }
             }
-            _ => {} // skip — tylko usunięcie z poczekalni
         }
-        conn.execute("DELETE FROM import_pending WHERE id = ?1", [id])
-            .map_err(|e| e.to_string())?;
+        progress.done += 1;
+        on_progress(&progress);
     }
-    Ok(())
+    progress
 }
 
 #[cfg(test)]
@@ -491,8 +519,10 @@ mod tests {
 
         // "importuj" wybranych: 2 nowe + duplikat → kopiowane do biblioteki
         let new_ids: Vec<i64> = news.iter().map(|p| p.id).collect();
-        resolve_pending(&conn, &root, &new_ids, "import").unwrap();
-        resolve_pending(&conn, &root, &[dups[0].id], "import").unwrap();
+        let r = resolve_pending(&conn, &root, &new_ids, "import", |_| {});
+        assert_eq!(r.ok, 2);
+        assert_eq!(r.errors, 0);
+        resolve_pending(&conn, &root, &[dups[0].id], "import", |_| {});
         assert!(list_pending(&conn).is_empty());
         let files_count: i64 = conn
             .query_row("SELECT count(*) FROM files", [], |r| r.get(0))
@@ -510,7 +540,7 @@ mod tests {
         assert!(list_pending(&conn).is_empty());
         // "pomiń" na pustej poczekalni to no-op
         let ids: Vec<i64> = list_pending(&conn).iter().map(|p| p.id).collect();
-        resolve_pending(&conn, &root, &ids, "skip").unwrap();
+        resolve_pending(&conn, &root, &ids, "skip", |_| {});
         assert!(list_pending(&conn).is_empty());
     }
 

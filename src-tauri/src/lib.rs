@@ -566,9 +566,38 @@ fn resolve_import_pending(
     ids: Vec<i64>,
     action: String,
 ) -> Result<(), String> {
+    if action == "import" {
+        // kopiowanie potrafi trwać (duże wideo) — w wątku z WŁASNYM połączeniem,
+        // bez trzymania locka AppState (inaczej całe UI zamiera); postęp eventami.
+        // resolve-done MUSI polecieć zawsze, inaczej globalna kolejka utknie.
+        std::thread::spawn(move || {
+            let total = ids.len() as u64;
+            let failed = || import::ResolveProgress { done: total, total, ok: 0, errors: total };
+            let run = || -> Option<import::ResolveProgress> {
+                let data_dir = app.path().app_data_dir().ok()?;
+                let conn = db::open(&data_dir).ok()?;
+                let root = db::get_setting(&conn, "library_path")?;
+                let app2 = app.clone();
+                Some(import::resolve_pending(
+                    &conn,
+                    std::path::Path::new(&root),
+                    &ids,
+                    &action,
+                    move |p| {
+                        app2.emit("resolve-progress", p.clone()).ok();
+                    },
+                ))
+            };
+            let progress = run().unwrap_or_else(failed);
+            app.emit("library-changed", ()).ok();
+            app.emit("resolve-done", progress).ok();
+        });
+        return Ok(());
+    }
+    // skip / delete_source — szybkie, synchronicznie
     let conn = state.db.lock().unwrap();
     let root = db::get_setting(&conn, "library_path").ok_or("brak biblioteki")?;
-    import::resolve_pending(&conn, std::path::Path::new(&root), &ids, &action)?;
+    import::resolve_pending(&conn, std::path::Path::new(&root), &ids, &action, |_| {});
     drop(conn);
     app.emit("library-changed", ()).ok();
     Ok(())
@@ -826,6 +855,36 @@ fn serve_media(
         .trim_start_matches('/')
         .replace("%2F", "/")
         .replace("%2f", "/");
+    // media://pending/<id> — MINIATURKA źródła z poczekalni (nie cały oryginał!).
+    // Poczekalnia potrafi mieć setki pozycji; serwowanie pełnych plików do siatki
+    // <img> zjadało pamięć i wywalało aplikację.
+    if let Some(pid) = url_path.strip_prefix("pending/") {
+        let Ok(pid) = pid.parse::<i64>() else {
+            return not_found();
+        };
+        let src: Option<String> = {
+            let state = app.state::<AppState>();
+            let conn = state.db.lock().unwrap();
+            conn.query_row(
+                "SELECT src FROM import_pending WHERE id = ?1",
+                [pid],
+                |r| r.get(0),
+            )
+            .ok()
+        };
+        let Some(src) = src else {
+            return not_found();
+        };
+        return match indexer::thumb_bytes(std::path::Path::new(&src)) {
+            Some(bytes) => tauri::http::Response::builder()
+                .header("Content-Type", "image/webp")
+                .header("Cache-Control", "no-store")
+                .body(bytes)
+                .unwrap(),
+            None => not_found(),
+        };
+    }
+
     let mut protected_key: Option<crypto::Key> = None;
     let abs = if let Some(hash) = url_path.strip_prefix("transcode/") {
         // media://transcode/<hash> — przetranskodowany plik z cache (H.264/AAC mp4)
@@ -842,47 +901,32 @@ fn serve_media(
     } else {
         let state = app.state::<AppState>();
         let conn = state.db.lock().unwrap();
-        // media://pending/<id> — podgląd pliku źródłowego z poczekalni importu
-        if let Some(pid) = url_path.strip_prefix("pending/") {
-            let Ok(pid) = pid.parse::<i64>() else {
-                return not_found();
-            };
-            let Ok(src) = conn.query_row(
-                "SELECT src FROM import_pending WHERE id = ?1",
-                [pid],
-                |r| r.get::<_, String>(0),
-            ) else {
-                return not_found();
-            };
-            PathBuf::from(src)
-        } else {
-            let Ok(id) = url_path.parse::<i64>() else {
-                return not_found();
-            };
-            let Some(root) = db::get_setting(&conn, "library_path") else {
-                return not_found();
-            };
-            let Ok((rel, album)) = conn.query_row(
-                "SELECT path, protected_album FROM files WHERE id = ?1",
-                [id],
-                |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<i64>>(1)?)),
-            ) else {
-                return not_found();
-            };
-            if let Some(album) = album {
-                // plik chroniony: wymagany klucz sesyjny odblokowanego albumu
-                match app.state::<protected::SessionKeys>().get(album) {
-                    Some(key) => protected_key = Some(key),
-                    None => {
-                        return tauri::http::Response::builder()
-                            .status(403)
-                            .body(Vec::new())
-                            .unwrap();
-                    }
+        let Ok(id) = url_path.parse::<i64>() else {
+            return not_found();
+        };
+        let Some(root) = db::get_setting(&conn, "library_path") else {
+            return not_found();
+        };
+        let Ok((rel, album)) = conn.query_row(
+            "SELECT path, protected_album FROM files WHERE id = ?1",
+            [id],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<i64>>(1)?)),
+        ) else {
+            return not_found();
+        };
+        if let Some(album) = album {
+            // plik chroniony: wymagany klucz sesyjny odblokowanego albumu
+            match app.state::<protected::SessionKeys>().get(album) {
+                Some(key) => protected_key = Some(key),
+                None => {
+                    return tauri::http::Response::builder()
+                        .status(403)
+                        .body(Vec::new())
+                        .unwrap();
                 }
             }
-            PathBuf::from(root).join(rel)
         }
+        PathBuf::from(root).join(rel)
     };
 
     // odszyfrowywanie w locie z dostępem swobodnym (przewijanie wideo działa)
@@ -1059,8 +1103,14 @@ pub fn run() {
             }
             not_found()
         })
-        .register_uri_scheme_protocol("media", |ctx, request| {
-            serve_media(ctx.app_handle(), request)
+        // asynchronicznie: całe serwowanie mediów (w tym dekodowanie miniatur
+        // poczekalni) schodzi z wątku handlera na pulę blokującą — inaczej siatka
+        // kilkudziesięciu miniatur zawieszała UI
+        .register_asynchronous_uri_scheme_protocol("media", |ctx, request, responder| {
+            let app = ctx.app_handle().clone();
+            tauri::async_runtime::spawn_blocking(move || {
+                responder.respond(serve_media(&app, request));
+            });
         })
         .setup(|app| {
             let data_dir = app.path().app_data_dir()?;

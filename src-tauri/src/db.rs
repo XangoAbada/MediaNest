@@ -142,6 +142,10 @@ const MIGRATIONS: &[&str] = &[
         src         TEXT PRIMARY KEY,
         imported_at INTEGER NOT NULL
     );",
+    // v11 — zapamiętaj ścieżkę docelową importu, by re-skan mógł ZWERYFIKOWAĆ, że
+    // plik nadal istnieje w bibliotece przed pominięciem (usunięty → można importować
+    // ponownie), zamiast ślepo ufać rekordowi w `imported`
+    "ALTER TABLE imported ADD COLUMN dst TEXT;",
 ];
 
 pub fn open(dir: &Path) -> anyhow::Result<Connection> {
