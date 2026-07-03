@@ -5,6 +5,7 @@ import { useApp } from "../stores/app";
 import { Thumb } from "./Thumb";
 import { EmptyState } from "./EmptyState";
 import { DateScrubber } from "./DateScrubber";
+import { FolderPicker } from "./FolderPicker";
 
 const GAP = 4;
 
@@ -15,6 +16,21 @@ export function Grid() {
   const timeline = useLibrary((s) => s.timeline);
   const scrollRef = useRef<HTMLDivElement>(null);
   const [width, setWidth] = useState(0);
+  const [menu, setMenu] = useState<{ x: number; y: number; ids: number[] } | null>(null);
+  const [pickerIds, setPickerIds] = useState<number[] | null>(null);
+
+  // zamknij menu kontekstowe na dowolne kliknięcie / Esc
+  useEffect(() => {
+    if (!menu) return;
+    const close = () => setMenu(null);
+    const onKey = (e: KeyboardEvent) => e.key === "Escape" && setMenu(null);
+    window.addEventListener("click", close);
+    window.addEventListener("keydown", onKey);
+    return () => {
+      window.removeEventListener("click", close);
+      window.removeEventListener("keydown", onKey);
+    };
+  }, [menu]);
 
   // kontener renderuje się zawsze (EmptyState w środku), więc observer
   // podpina się raz i działa — szerokość znana od pierwszego layoutu
@@ -92,7 +108,7 @@ export function Grid() {
                   <div
                     key={c}
                     style={{ width: cellSize, height: cellSize }}
-                    className={`relative cursor-pointer ${
+                    className={`group relative cursor-pointer ${
                       selected ? "rounded-[5px] ring-2 ring-accent" : ""
                     }`}
                     onClick={(e) => {
@@ -105,16 +121,41 @@ export function Grid() {
                         openLightbox(idx);
                       }
                     }}
+                    onContextMenu={(e) => {
+                      if (!item) return;
+                      e.preventDefault();
+                      const ids =
+                        selection.has(item.id) && selection.size > 0
+                          ? [...selection]
+                          : [item.id];
+                      setMenu({ x: e.clientX, y: e.clientY, ids });
+                    }}
                   >
                     {item ? (
                       <Thumb item={item} />
                     ) : (
                       <div className="h-full w-full rounded-[3px] bg-surface" />
                     )}
-                    {selected && (
-                      <span className="absolute right-1 top-1 flex h-5 w-5 items-center justify-center rounded-full bg-accent text-[11px] text-white">
+                    {/* widoczny checkbox: zawsze przy aktywnym zaznaczeniu, inaczej na hover */}
+                    {item && (
+                      <button
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          toggleSelect(item.id, idx, false);
+                        }}
+                        className={`absolute left-1 top-1 flex h-5 w-5 items-center justify-center rounded-full border text-[11px] transition-opacity ${
+                          selected
+                            ? "border-accent bg-accent text-white opacity-100"
+                            : `border-white/70 bg-black/40 text-transparent hover:text-white ${
+                                selection.size > 0
+                                  ? "opacity-100"
+                                  : "opacity-0 group-hover:opacity-100"
+                              }`
+                        }`}
+                        title="Zaznacz"
+                      >
                         ✓
-                      </span>
+                      </button>
                     )}
                   </div>
                 );
@@ -131,6 +172,26 @@ export function Grid() {
           cols={cols}
           rowHeight={rowHeight}
         />
+      )}
+      {menu && (
+        <div
+          className="fixed z-[65] min-w-44 overflow-hidden rounded-md border border-edge bg-raised py-1 text-[13px] shadow-xl"
+          style={{ left: menu.x, top: menu.y }}
+          onClick={(e) => e.stopPropagation()}
+        >
+          <button
+            onClick={() => {
+              setPickerIds(menu.ids);
+              setMenu(null);
+            }}
+            className="block w-full px-3 py-1.5 text-left hover:bg-accent/15"
+          >
+            Przenieś do folderu…{menu.ids.length > 1 ? ` (${menu.ids.length})` : ""}
+          </button>
+        </div>
+      )}
+      {pickerIds && (
+        <FolderPicker ids={pickerIds} onClose={() => setPickerIds(null)} />
       )}
     </div>
   );

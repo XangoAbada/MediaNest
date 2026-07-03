@@ -278,6 +278,63 @@ fn remove_from_album(
 }
 
 #[tauri::command]
+fn move_to_folder(
+    app: tauri::AppHandle,
+    state: tauri::State<AppState>,
+    dst: String,
+    file_ids: Vec<i64>,
+) -> Result<u64, String> {
+    let conn = state.db.lock().unwrap();
+    let root = db::get_setting(&conn, "library_path").ok_or("brak biblioteki")?;
+    // pliki chronione (zaszyfrowane .mnlock) pomijamy — nie ruszamy ich ścieżek
+    let safe: Vec<i64> = file_ids
+        .into_iter()
+        .filter(|id| {
+            conn.query_row(
+                "SELECT protected_album FROM files WHERE id = ?1",
+                [id],
+                |r| r.get::<_, Option<i64>>(0),
+            )
+            .ok()
+            .flatten()
+            .is_none()
+        })
+        .collect();
+    let moved = catalog::move_files_to_folder(
+        &conn,
+        std::path::Path::new(&root),
+        &dst,
+        &safe,
+        &format!("do folderu: {dst}"),
+    )?;
+    drop(conn);
+    app.emit("library-changed", ()).ok();
+    Ok(moved.len() as u64)
+}
+
+#[tauri::command]
+fn create_folder(
+    state: tauri::State<AppState>,
+    parent: String,
+    name: String,
+) -> Result<String, String> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err("Podaj nazwę folderu".into());
+    }
+    let conn = state.db.lock().unwrap();
+    let root = db::get_setting(&conn, "library_path").ok_or("brak biblioteki")?;
+    let clean = catalog::sanitize_component(name);
+    let rel = if parent.is_empty() {
+        clean
+    } else {
+        format!("{parent}/{clean}")
+    };
+    std::fs::create_dir_all(std::path::Path::new(&root).join(&rel)).map_err(|e| e.to_string())?;
+    Ok(rel)
+}
+
+#[tauri::command]
 fn timeline_months(state: tauri::State<AppState>) -> Vec<(String, i64)> {
     let conn = state.db.lock().unwrap();
     catalog::timeline_months(&conn)
@@ -938,6 +995,8 @@ pub fn run() {
             delete_album,
             add_to_album,
             remove_from_album,
+            move_to_folder,
+            create_folder,
             timeline_months,
             timeline_histogram,
             library_stats,

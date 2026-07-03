@@ -126,6 +126,9 @@ const MIGRATIONS: &[&str] = &[
 pub fn open(dir: &Path) -> anyhow::Result<Connection> {
     std::fs::create_dir_all(dir)?;
     let conn = Connection::open(dir.join("medianest.db"))?;
+    // indekser i komendy UI pracują na osobnych połączeniach; bez tego równoległy
+    // zapis (np. zmiana biblioteki w trakcie skanu) padał na SQLITE_BUSY
+    conn.busy_timeout(std::time::Duration::from_secs(10))?;
     conn.pragma_update(None, "journal_mode", "WAL")?;
     conn.pragma_update(None, "synchronous", "NORMAL")?;
     conn.pragma_update(None, "foreign_keys", "ON")?;

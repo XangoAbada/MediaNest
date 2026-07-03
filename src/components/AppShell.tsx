@@ -4,6 +4,7 @@ import { listen } from "@tauri-apps/api/event";
 import { useApp, type View } from "../stores/app";
 import { useLibrary, type Sort } from "../stores/library";
 import { EmptyState } from "./EmptyState";
+import { FolderPicker } from "./FolderPicker";
 import { FolderTree } from "./FolderTree";
 import { Grid } from "./Grid";
 import { Lightbox } from "./Lightbox";
@@ -122,6 +123,7 @@ function SelectionBar() {
   const { selection, clearSelection, refresh } = useLibrary();
   const toast = useApp((s) => s.toast);
   const [albums, setAlbums] = useState<{ id: number; name: string }[]>([]);
+  const [movingToFolder, setMovingToFolder] = useState(false);
 
   useEffect(() => {
     if (selection.size > 0) {
@@ -176,6 +178,12 @@ function SelectionBar() {
         ))}
       </select>
       <button
+        onClick={() => setMovingToFolder(true)}
+        className="rounded-md border border-edge px-3 py-1 hover:border-ink-faint"
+      >
+        Przenieś do folderu…
+      </button>
+      <button
         onClick={async () => {
           const n = await invoke<number>("trash_files", { ids });
           toast(`Przeniesiono ${n} plików do kosza`);
@@ -192,6 +200,9 @@ function SelectionBar() {
       >
         Wyczyść zaznaczenie
       </button>
+      {movingToFolder && (
+        <FolderPicker ids={ids} onClose={() => setMovingToFolder(false)} />
+      )}
     </div>
   );
 }

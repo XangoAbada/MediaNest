@@ -7,6 +7,7 @@ import {
   type FileInfo,
 } from "../stores/library";
 import { Thumb } from "./Thumb";
+import { FolderPicker } from "./FolderPicker";
 import { PAGE } from "../stores/library";
 
 const SLIDESHOW_MS = 4000;
@@ -112,6 +113,7 @@ export function Lightbox() {
   const [zoom, setZoom] = useState(1);
   const [pan, setPan] = useState({ x: 0, y: 0 });
   const [showInfo, setShowInfo] = useState(false);
+  const [moving, setMoving] = useState(false);
   const [slideshow, setSlideshow] = useState(false);
   const [uiVisible, setUiVisible] = useState(true);
   const uiTimer = useRef<number>(0);
@@ -165,7 +167,12 @@ export function Lightbox() {
   // skróty klawiszowe
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
+      if (moving) return; // picker folderu przejmuje klawiaturę
       switch (e.key) {
+        case "m":
+        case "M":
+          setMoving(true);
+          break;
         case "Escape":
           if (document.fullscreenElement) document.exitFullscreen();
           else closeLightbox();
@@ -220,7 +227,7 @@ export function Lightbox() {
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [prev, next, closeLightbox]);
+  }, [prev, next, closeLightbox, moving]);
 
   if (!item) {
     return <div className="fixed inset-0 z-50 bg-black" onClick={closeLightbox} />;
@@ -307,6 +314,13 @@ export function Lightbox() {
                   {slideshow ? "⏸ Pokaz" : "▶ Pokaz"}
                 </button>
                 <button
+                  onClick={() => setMoving(true)}
+                  className="text-white/70 hover:text-white"
+                  title="Przenieś do folderu (M)"
+                >
+                  🗀 Przenieś
+                </button>
+                <button
                   onClick={() => setShowInfo((v) => !v)}
                   className={`hover:text-white ${showInfo ? "text-accent-hover" : "text-white/70"}`}
                   title="Informacje (I)"
@@ -360,6 +374,16 @@ export function Lightbox() {
       </div>
 
       {showInfo && <InfoPanel id={item.id} />}
+      {moving && (
+        <FolderPicker
+          ids={[item.id]}
+          onClose={() => setMoving(false)}
+          onMoved={() => {
+            const s = useLibrary.getState();
+            if ((s.lightbox as number) >= s.total - 1) s.closeLightbox();
+          }}
+        />
+      )}
     </div>
   );
 }

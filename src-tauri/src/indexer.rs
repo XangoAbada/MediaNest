@@ -76,12 +76,19 @@ pub fn run(app: AppHandle) {
     let mut total: i64 = 0;
 
     loop {
+        // Kolejność jest istotna: najpierw konsumujemy sygnał rescan, POTEM czytamy
+        // library_path. set_library_path zapisuje nową ścieżkę przed ustawieniem
+        // rescan=true, więc gdy widzimy rescan=true, odczyt poniżej zwraca już nową
+        // ścieżkę. Odwrotna kolejność powodowała wyścig: zmiana biblioteki wpadająca
+        // między odczyt root a swap skanowała stary folder i gubiła sygnał — nowy
+        // folder nigdy się nie indeksował.
+        let do_scan = ctl.rescan.swap(false, Ordering::SeqCst);
         let Some(root) = db::get_setting(&conn, "library_path").map(PathBuf::from) else {
             std::thread::sleep(Duration::from_secs(1));
             continue;
         };
 
-        if ctl.rescan.swap(false, Ordering::SeqCst) {
+        if do_scan {
             if let Err(e) = scan(&conn, &root) {
                 eprintln!("scan error: {e}");
             }

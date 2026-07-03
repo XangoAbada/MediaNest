@@ -223,6 +223,11 @@ pub fn list_albums(conn: &Connection) -> Vec<Album> {
     .unwrap_or_default()
 }
 
+/// Zamienia znaki niedozwolone w nazwie katalogu na „_".
+pub fn sanitize_component(name: &str) -> String {
+    name.replace(['/', '\\', ':', '*', '?', '"', '<', '>', '|'], "_")
+}
+
 pub fn create_album(
     conn: &Connection,
     root: &Path,
@@ -235,10 +240,7 @@ pub fn create_album(
     }
     let folder_path = if album_type == "folder" {
         // fizyczny folder Albumy/<nazwa> w bibliotece
-        let rel = format!(
-            "Albumy/{}",
-            name.replace(['/', '\\', ':', '*', '?', '"', '<', '>', '|'], "_")
-        );
+        let rel = format!("Albumy/{}", sanitize_component(name));
         std::fs::create_dir_all(root.join(&rel)).map_err(|e| e.to_string())?;
         Some(rel)
     } else {
@@ -257,6 +259,60 @@ pub fn delete_album(conn: &Connection, id: i64) -> Result<(), String> {
     conn.execute("DELETE FROM albums WHERE id = ?1", [id])
         .map_err(|e| e.to_string())?;
     Ok(())
+}
+
+/// Fizycznie przenosi pliki do folderu (ścieżka względna do `root`; `""` = korzeń
+/// biblioteki). Zwraca id plików faktycznie znajdujących się w folderze (przeniesione
+/// lub już tam będące). Operacja jest logowana (undo przez move); pliki, których nie
+/// udało się przenieść (brak wpisu / błąd rename), są pomijane.
+pub fn move_files_to_folder(
+    conn: &Connection,
+    root: &Path,
+    folder: &str,
+    file_ids: &[i64],
+    op_label: &str,
+) -> Result<Vec<i64>, String> {
+    if !folder.is_empty() {
+        std::fs::create_dir_all(root.join(folder)).map_err(|e| e.to_string())?;
+    }
+    conn.execute(
+        "INSERT INTO operations (kind, label, created_at) VALUES ('move', ?1, ?2)",
+        rusqlite::params![op_label, now()],
+    )
+    .map_err(|e| e.to_string())?;
+    let op_id = conn.last_insert_rowid();
+    let mut moved = Vec::new();
+    for id in file_ids {
+        let Ok(rel) = conn.query_row("SELECT path FROM files WHERE id = ?1", [id], |r| {
+            r.get::<_, String>(0)
+        }) else {
+            continue;
+        };
+        let already = rel.rsplit_once('/').map(|(p, _)| p).unwrap_or("") == folder;
+        if already {
+            moved.push(*id);
+            continue; // już w docelowym folderze
+        }
+        let name = rel.rsplit('/').next().unwrap_or(&rel);
+        let (dst_abs, dst_rel) = crate::import::unique_dst(root, folder, name);
+        if std::fs::rename(root.join(&rel), &dst_abs).is_err() {
+            continue;
+        }
+        let parent = dst_rel.rsplit_once('/').map(|(p, _)| p).unwrap_or("");
+        let fname = dst_rel.rsplit('/').next().unwrap_or(&dst_rel);
+        conn.execute(
+            "UPDATE files SET path = ?2, parent = ?3, name = ?4 WHERE id = ?1",
+            rusqlite::params![id, dst_rel, parent, fname],
+        )
+        .map_err(|e| e.to_string())?;
+        conn.execute(
+            "INSERT INTO operation_items (op_id, src, dst) VALUES (?1, ?2, ?3)",
+            rusqlite::params![op_id, rel, dst_rel],
+        )
+        .map_err(|e| e.to_string())?;
+        moved.push(*id);
+    }
+    Ok(moved)
 }
 
 /// Dodaje pliki do albumu. Wirtualny: tylko referencje. Folderowy: fizyczne
@@ -278,40 +334,15 @@ pub fn add_to_album(
     let mut added = 0u64;
     if album_type == "folder" {
         let folder = folder_path.ok_or("album folderowy bez ścieżki")?;
-        conn.execute(
-            "INSERT INTO operations (kind, label, created_at) VALUES ('move', ?1, ?2)",
-            rusqlite::params![format!("do albumu: {folder}"), now()],
-        )
-        .map_err(|e| e.to_string())?;
-        let op_id = conn.last_insert_rowid();
-        for id in file_ids {
-            let Ok(rel) = conn.query_row("SELECT path FROM files WHERE id = ?1", [id], |r| {
-                r.get::<_, String>(0)
-            }) else {
-                continue;
-            };
-            if rel.starts_with(&folder) {
-                added += move_noop_link(conn, album_id, *id)?;
-                continue; // już w folderze albumu
-            }
-            let name = rel.rsplit('/').next().unwrap_or(&rel);
-            let (dst_abs, dst_rel) = crate::import::unique_dst(root, &folder, name);
-            if std::fs::rename(root.join(&rel), &dst_abs).is_err() {
-                continue;
-            }
-            let parent = dst_rel.rsplit_once('/').map(|(p, _)| p).unwrap_or("");
-            let fname = dst_rel.rsplit('/').next().unwrap_or(&dst_rel);
-            conn.execute(
-                "UPDATE files SET path = ?2, parent = ?3, name = ?4 WHERE id = ?1",
-                rusqlite::params![id, dst_rel, parent, fname],
-            )
-            .map_err(|e| e.to_string())?;
-            conn.execute(
-                "INSERT INTO operation_items (op_id, src, dst) VALUES (?1, ?2, ?3)",
-                rusqlite::params![op_id, rel, dst_rel],
-            )
-            .map_err(|e| e.to_string())?;
-            added += move_noop_link(conn, album_id, *id)?;
+        let moved = move_files_to_folder(
+            conn,
+            root,
+            &folder,
+            file_ids,
+            &format!("do albumu: {folder}"),
+        )?;
+        for id in moved {
+            added += move_noop_link(conn, album_id, id)?;
         }
     } else {
         for id in file_ids {
@@ -594,6 +625,37 @@ mod tests {
         // usunięcie albumu nie usuwa plików
         delete_album(&conn, fold).unwrap();
         assert!(root.join("Albumy/Rodzina/a.jpg").exists());
+    }
+
+    #[test]
+    fn move_to_folder_moves_and_logs() {
+        let (conn, root) = setup("movefolder");
+        std::fs::create_dir_all(root.join("2020")).unwrap();
+        std::fs::write(root.join("2020/a.jpg"), b"a").unwrap();
+        let id = add(&conn, "2020/a.jpg", "a.jpg");
+
+        let moved =
+            move_files_to_folder(&conn, &root, "Foto/2021", &[id], "do folderu: Foto/2021").unwrap();
+        assert_eq!(moved, vec![id]);
+        assert!(!root.join("2020/a.jpg").exists());
+        assert!(root.join("Foto/2021/a.jpg").exists());
+        let (path, parent): (String, String) = conn
+            .query_row("SELECT path, parent FROM files WHERE id=?1", [id], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(path, "Foto/2021/a.jpg");
+        assert_eq!(parent, "Foto/2021");
+        // wpis move w logu (możliwość cofnięcia)
+        let op: String = conn
+            .query_row("SELECT kind FROM operations ORDER BY id DESC LIMIT 1", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(op, "move");
+
+        // ponowne przeniesienie do tego samego folderu = no-op (już tam jest)
+        let again = move_files_to_folder(&conn, &root, "Foto/2021", &[id], "x").unwrap();
+        assert_eq!(again, vec![id]);
+        assert!(root.join("Foto/2021/a.jpg").exists());
     }
 
     #[test]
