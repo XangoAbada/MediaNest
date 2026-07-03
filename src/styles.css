@@ -1,0 +1,102 @@
+@import "tailwindcss";
+
+/* ==========================================================================
+   MediaNest Design System — tokeny (dark-first)
+   Filozofia: UI ciemny i wycofany, zdjęcia są kolorem interfejsu.
+   ========================================================================== */
+
+@theme {
+  /* Powierzchnie */
+  --color-app: #0c0c0f; /* tło główne — neutralna prawie-czerń */
+  --color-surface: #16161a; /* sidebar, toolbar, karty */
+  --color-raised: #1e1e24; /* dialogi, menu, popovery */
+
+  /* Krawędzie i tekst */
+  --color-edge: #2a2a32;
+  --color-ink: #ededf0;
+  --color-ink-dim: #a0a0ab;
+  --color-ink-faint: #63636e;
+
+  /* Semantyczne */
+  --color-accent: #6366f1;
+  --color-accent-hover: #818cf8;
+  --color-danger: #ef4444;
+  --color-success: #22c55e;
+  --color-warning: #f59e0b;
+  --color-protected: #f59e0b;
+
+  /* Typografia */
+  --font-ui: "Inter", "Segoe UI Variable", "Segoe UI", system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", "Cascadia Mono", Consolas, monospace;
+
+  /* Promienie */
+  --radius-sm: 6px;
+  --radius-md: 10px;
+  --radius-lg: 16px;
+
+  /* Cienie (ciemny motyw — mocniejsze) */
+  --shadow-md: 0 4px 16px rgb(0 0 0 / 0.4);
+  --shadow-lg: 0 12px 40px rgb(0 0 0 / 0.6);
+
+  /* Ruch */
+  --ease-out-app: cubic-bezier(0.2, 0, 0, 1);
+}
+
+/* Motyw jasny — nadpisuje surowe zmienne, utilities Tailwinda używają var() */
+[data-theme="light"] {
+  --color-app: #f5f5f7;
+  --color-surface: #ffffff;
+  --color-raised: #ffffff;
+  --color-edge: #e2e2e6;
+  --color-ink: #1a1a1f;
+  --color-ink-dim: #55555e;
+  --color-ink-faint: #9494a0;
+  --shadow-md: 0 4px 16px rgb(0 0 0 / 0.1);
+  --shadow-lg: 0 12px 40px rgb(0 0 0 / 0.15);
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  font-family: var(--font-ui);
+  font-size: 14px;
+  background: var(--color-app);
+  color: var(--color-ink);
+  overflow: hidden;
+  user-select: none;
+  -webkit-font-smoothing: antialiased;
+}
+
+::selection {
+  background: color-mix(in srgb, var(--color-accent) 40%, transparent);
+}
+
+/* Scrollbary pasujące do motywu */
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--color-edge);
+  border-radius: 5px;
+  border: 2px solid transparent;
+  background-clip: content-box;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--color-ink-faint);
+  background-clip: content-box;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+/* siatka ze scrubberem daty przejmuje rolę paska przewijania */
+.no-native-scrollbar::-webkit-scrollbar {
+  width: 0;
+  height: 0;
+}
