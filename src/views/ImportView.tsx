@@ -16,7 +16,7 @@ interface ImportPlan {
 interface ImportProgress {
   done: number;
   total: number;
-  imported: number;
+  new_files: number;
   duplicates: number;
   errors: number;
 }
@@ -26,13 +26,14 @@ interface PendingItem {
   src: string;
   dst: string;
   size: number;
-  dup_id: number;
-  dup_path: string;
-  dup_name: string;
-  dup_size: number;
+  kind: number;
+  // pola dup_* wypełnione tylko dla duplikatów; dla nowych plików null
+  dup_id: number | null;
+  dup_path: string | null;
+  dup_name: string | null;
+  dup_size: number | null;
   dup_thumb: string | null;
   dup_taken_at: number | null;
-  kind: number;
 }
 
 const TEMPLATES: [string, string][] = [
@@ -83,13 +84,20 @@ function TemplatePicker({
   );
 }
 
+function basename(p: string) {
+  return p.split(/[\\/]/).pop() || p;
+}
+
 function PendingReview({ onDone }: { onDone: () => void }) {
   const [items, setItems] = useState<PendingItem[]>([]);
+  const [selected, setSelected] = useState<Set<number>>(new Set());
   const [busy, setBusy] = useState(false);
 
+  // domyślnie zaznaczone są nowe pliki, duplikaty odznaczone
   const load = () =>
     invoke<PendingItem[]>("list_import_pending").then((rows) => {
       setItems(rows);
+      setSelected(new Set(rows.filter((r) => r.dup_id == null).map((r) => r.id)));
       if (rows.length === 0) onDone();
     });
   useEffect(() => {
@@ -97,6 +105,7 @@ function PendingReview({ onDone }: { onDone: () => void }) {
   }, []);
 
   async function resolve(ids: number[], action: string) {
+    if (ids.length === 0) return;
     setBusy(true);
     try {
       await invoke("resolve_import_pending", { ids, action });
@@ -106,111 +115,172 @@ function PendingReview({ onDone }: { onDone: () => void }) {
     }
   }
 
+  const toggle = (id: number) =>
+    setSelected((s) => {
+      const n = new Set(s);
+      n.has(id) ? n.delete(id) : n.add(id);
+      return n;
+    });
+  const toggleGroup = (ids: number[], on: boolean) =>
+    setSelected((s) => {
+      const n = new Set(s);
+      ids.forEach((id) => (on ? n.add(id) : n.delete(id)));
+      return n;
+    });
+
   if (items.length === 0) return null;
-  const allIds = items.map((i) => i.id);
+  const news = items.filter((i) => i.dup_id == null);
+  const dups = items.filter((i) => i.dup_id != null);
+  const selIds = [...selected].filter((id) => items.some((i) => i.id === id));
+  const newAllOn = news.length > 0 && news.every((i) => selected.has(i.id));
 
   return (
     <div className="mx-auto max-w-4xl p-6">
-      <div className="mb-4 flex items-center gap-3">
-        <h2 className="text-lg font-semibold">
-          Duplikaty z importu ({items.length})
-        </h2>
+      <h2 className="text-lg font-semibold">Przegląd importu ({items.length})</h2>
+      <p className="mt-1 mb-4 text-[13px] text-ink-dim">
+        Nic nie zostało jeszcze skopiowane. Zaznacz pliki, które mają trafić do
+        biblioteki. „Usuń ze źródła" przenosi plik źródłowy do kosza systemowego.
+      </p>
+
+      {/* pasek akcji na zaznaczonych */}
+      <div className="sticky top-0 z-10 mb-4 flex items-center gap-3 rounded-lg border border-edge bg-surface/95 px-4 py-2.5 backdrop-blur">
+        <span className="text-[13px] text-ink-dim">
+          Zaznaczono <b className="text-ink">{selIds.length}</b> z {items.length}
+        </span>
         <div className="ml-auto flex gap-2 text-[13px]">
           <button
-            disabled={busy}
-            onClick={() => resolve(allIds, "import")}
-            className="rounded-md border border-edge bg-raised px-3 py-1.5 hover:border-ink-faint disabled:opacity-50"
+            disabled={busy || selIds.length === 0}
+            onClick={() => resolve(selIds, "import")}
+            className="rounded-md bg-accent px-3 py-1.5 font-medium text-white hover:bg-accent-hover disabled:opacity-50"
           >
-            Importuj wszystkie
+            Dodaj zaznaczone do biblioteki
           </button>
           <button
-            disabled={busy}
-            onClick={() => resolve(allIds, "skip")}
+            disabled={busy || selIds.length === 0}
+            onClick={() => resolve(selIds, "skip")}
             className="rounded-md border border-edge bg-raised px-3 py-1.5 hover:border-ink-faint disabled:opacity-50"
           >
-            Pomiń wszystkie
+            Pomiń zaznaczone
           </button>
           <button
-            disabled={busy}
-            onClick={() => resolve(allIds, "delete_source")}
+            disabled={busy || selIds.length === 0}
+            onClick={() => resolve(selIds, "delete_source")}
             className="rounded-md border border-danger/40 px-3 py-1.5 text-danger hover:bg-danger/10 disabled:opacity-50"
           >
-            Usuń wszystkie ze źródła
+            Usuń zaznaczone ze źródła
           </button>
         </div>
       </div>
-      <p className="mb-4 text-[13px] text-ink-dim">
-        Te pliki mają identyczną treść jak pliki już obecne w bibliotece. Nic nie
-        zostało skopiowane — zdecyduj, co z nimi zrobić. „Usuń ze źródła" przenosi
-        plik źródłowy do kosza systemowego.
-      </p>
-      <div className="space-y-3">
-        {items.map((item) => (
-          <div
-            key={item.id}
-            className="flex items-center gap-4 rounded-lg border border-edge bg-surface p-3"
-          >
-            <div className="flex gap-2">
-              <figure className="w-28 text-center">
+
+      {/* sekcja: nowe pliki (bez duplikatu) */}
+      {news.length > 0 && (
+        <section className="mb-6">
+          <div className="mb-2 flex items-center gap-3">
+            <h3 className="text-[13px] font-semibold uppercase tracking-wide text-ink-dim">
+              Do importu — nowe ({news.length})
+            </h3>
+            <label className="flex cursor-pointer items-center gap-1.5 text-[12px] text-ink-dim">
+              <input
+                type="checkbox"
+                checked={newAllOn}
+                onChange={(e) => toggleGroup(news.map((i) => i.id), e.target.checked)}
+                className="accent-(--color-accent)"
+              />
+              Zaznacz wszystkie
+            </label>
+          </div>
+          {/* ponytail: bez windowingu; dodać wirtualizację, gdy duże importy zaczną zamulać */}
+          <div className="grid grid-cols-[repeat(auto-fill,minmax(120px,1fr))] gap-2">
+            {news.map((item) => (
+              <label
+                key={item.id}
+                className="group relative cursor-pointer overflow-hidden rounded-lg border border-edge bg-surface"
+              >
+                <input
+                  type="checkbox"
+                  checked={selected.has(item.id)}
+                  onChange={() => toggle(item.id)}
+                  className="absolute left-1.5 top-1.5 z-10 accent-(--color-accent)"
+                />
                 <img
                   src={convertFileSrc(`pending/${item.id}`, "media")}
-                  className="h-24 w-28 rounded-[4px] object-cover"
+                  className={`h-28 w-full object-cover transition-opacity ${
+                    selected.has(item.id) ? "" : "opacity-40"
+                  }`}
                 />
-                <figcaption className="mt-1 text-[10px] uppercase tracking-wide text-ink-faint">
-                  Nowy
-                </figcaption>
-              </figure>
-              <figure className="w-28 text-center">
-                {item.dup_thumb ? (
-                  <img
-                    src={convertFileSrc(item.dup_thumb, "thumb")}
-                    className="h-24 w-28 rounded-[4px] object-cover"
-                  />
-                ) : (
-                  <div className="flex h-24 w-28 items-center justify-center rounded-[4px] bg-raised text-2xl opacity-40">
-                    {item.kind === 1 ? "🎬" : "🖼"}
-                  </div>
-                )}
-                <figcaption className="mt-1 text-[10px] uppercase tracking-wide text-ink-faint">
-                  W bibliotece
-                </figcaption>
-              </figure>
-            </div>
-            <div className="min-w-0 flex-1 font-mono text-[11px] leading-5 text-ink-dim">
-              <div className="truncate" title={item.src}>
-                {item.src}
-              </div>
-              <div className="truncate text-ink-faint" title={item.dup_path}>
-                = {item.dup_path}
-              </div>
-              <div className="text-ink-faint">{formatSize(item.size)}</div>
-            </div>
-            <div className="flex shrink-0 flex-col gap-1.5 text-[12px]">
-              <button
-                disabled={busy}
-                onClick={() => resolve([item.id], "import")}
-                className="rounded-md bg-accent px-3 py-1 text-white hover:bg-accent-hover disabled:opacity-50"
-              >
-                Importuj
-              </button>
-              <button
-                disabled={busy}
-                onClick={() => resolve([item.id], "skip")}
-                className="rounded-md border border-edge px-3 py-1 hover:border-ink-faint disabled:opacity-50"
-              >
-                Pomiń
-              </button>
-              <button
-                disabled={busy}
-                onClick={() => resolve([item.id], "delete_source")}
-                className="rounded-md border border-danger/40 px-3 py-1 text-danger hover:bg-danger/10 disabled:opacity-50"
-              >
-                Usuń ze źródła
-              </button>
-            </div>
+                <div
+                  className="truncate px-2 py-1 font-mono text-[10px] text-ink-dim"
+                  title={item.src}
+                >
+                  {basename(item.src)}
+                </div>
+              </label>
+            ))}
           </div>
-        ))}
-      </div>
+        </section>
+      )}
+
+      {/* sekcja: duplikaty (identyczna treść już w bibliotece) */}
+      {dups.length > 0 && (
+        <section>
+          <h3 className="mb-2 text-[13px] font-semibold uppercase tracking-wide text-ink-dim">
+            Duplikaty ({dups.length}) — identyczna treść już w bibliotece
+          </h3>
+          <div className="space-y-3">
+            {dups.map((item) => (
+              <label
+                key={item.id}
+                className="flex cursor-pointer items-center gap-4 rounded-lg border border-edge bg-surface p-3"
+              >
+                <input
+                  type="checkbox"
+                  checked={selected.has(item.id)}
+                  onChange={() => toggle(item.id)}
+                  className="accent-(--color-accent)"
+                />
+                <div className="flex gap-2">
+                  <figure className="w-28 text-center">
+                    <img
+                      src={convertFileSrc(`pending/${item.id}`, "media")}
+                      className="h-24 w-28 rounded-[4px] object-cover"
+                    />
+                    <figcaption className="mt-1 text-[10px] uppercase tracking-wide text-ink-faint">
+                      Nowy
+                    </figcaption>
+                  </figure>
+                  <figure className="w-28 text-center">
+                    {item.dup_thumb ? (
+                      <img
+                        src={convertFileSrc(item.dup_thumb, "thumb")}
+                        className="h-24 w-28 rounded-[4px] object-cover"
+                      />
+                    ) : (
+                      <div className="flex h-24 w-28 items-center justify-center rounded-[4px] bg-raised text-2xl opacity-40">
+                        {item.kind === 1 ? "🎬" : "🖼"}
+                      </div>
+                    )}
+                    <figcaption className="mt-1 text-[10px] uppercase tracking-wide text-ink-faint">
+                      W bibliotece
+                    </figcaption>
+                  </figure>
+                </div>
+                <div className="min-w-0 flex-1 font-mono text-[11px] leading-5 text-ink-dim">
+                  <div className="truncate" title={item.src}>
+                    {item.src}
+                  </div>
+                  <div
+                    className="truncate text-ink-faint"
+                    title={item.dup_path ?? ""}
+                  >
+                    = {item.dup_path}
+                  </div>
+                  <div className="text-ink-faint">{formatSize(item.size)}</div>
+                </div>
+              </label>
+            ))}
+          </div>
+        </section>
+      )}
     </div>
   );
 }
@@ -237,7 +307,8 @@ export function ImportView() {
       setProgress(null);
       setFinished(e.payload);
       refresh();
-      if (e.payload.duplicates > 0) setReviewing(true);
+      // skan niczego nie kopiuje — zawsze przechodzimy do przeglądu wyboru
+      if (e.payload.new_files > 0 || e.payload.duplicates > 0) setReviewing(true);
     });
     return () => {
       un1.then((f) => f());
@@ -271,9 +342,9 @@ export function ImportView() {
     <div className="mx-auto max-w-2xl p-6">
       <h2 className="text-lg font-semibold tracking-tight">Import plików</h2>
       <p className="mt-1 text-[13px] text-ink-dim">
-        Kopiuje zdjęcia i filmy do biblioteki według wybranego schematu. Każdy
-        plik jest weryfikowany hashem po skopiowaniu, a duplikaty trafiają do
-        poczekalni zamiast do biblioteki.
+        Skanuje zdjęcia i filmy oraz wykrywa duplikaty, ale nic nie kopiuje — po
+        skanie wybierasz zaznaczeniem, co trafi do biblioteki. Wybrane pliki są
+        układane według schematu i weryfikowane hashem po skopiowaniu.
       </p>
 
       <section className="mt-5 space-y-4 rounded-lg border border-edge bg-surface p-5">
@@ -343,7 +414,7 @@ export function ImportView() {
             disabled={planning || plan.total === 0}
             onClick={() => {
               setFinished(null);
-              setProgress({ done: 0, total: plan.total, imported: 0, duplicates: 0, errors: 0 });
+              setProgress({ done: 0, total: plan.total, new_files: 0, duplicates: 0, errors: 0 });
               invoke("import_run", { source, photoTemplate, videoTemplate: videoTpl });
             }}
             className="mt-4 rounded-md bg-accent px-5 py-2 text-sm font-medium text-white hover:bg-accent-hover disabled:opacity-50"
@@ -356,7 +427,7 @@ export function ImportView() {
       {progress && (
         <section className="mt-4 rounded-lg border border-edge bg-surface p-5">
           <div className="mb-2 flex justify-between text-[13px]">
-            <span>Importowanie…</span>
+            <span>Skanowanie…</span>
             <span className="text-ink-dim">
               {progress.done} / {progress.total}
             </span>
@@ -368,7 +439,7 @@ export function ImportView() {
             />
           </div>
           <div className="mt-2 flex gap-4 text-[12px] text-ink-dim">
-            <span>✓ {progress.imported} zaimportowane</span>
+            <span>✓ {progress.new_files} nowych</span>
             <span>⧉ {progress.duplicates} duplikaty</span>
             {progress.errors > 0 && (
               <span className="text-danger">⚠ {progress.errors} błędy</span>
@@ -379,14 +450,14 @@ export function ImportView() {
 
       {finished && !progress && (
         <section className="mt-4 rounded-lg border border-success/30 bg-success/5 p-5 text-[13px]">
-          <b>Import zakończony.</b> Zaimportowano {finished.imported}, duplikatów:{" "}
+          <b>Skan zakończony.</b> Nowych plików: {finished.new_files}, duplikatów:{" "}
           {finished.duplicates}, błędów: {finished.errors}.
-          {finished.duplicates > 0 && (
+          {finished.new_files + finished.duplicates > 0 && (
             <button
               onClick={() => setReviewing(true)}
               className="ml-3 rounded-md bg-accent px-3 py-1 text-white hover:bg-accent-hover"
             >
-              Przejrzyj duplikaty
+              Przejrzyj i wybierz
             </button>
           )}
         </section>

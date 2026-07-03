@@ -121,6 +121,21 @@ const MIGRATIONS: &[&str] = &[
     "ALTER TABLE albums ADD COLUMN key_salt BLOB;
      ALTER TABLE albums ADD COLUMN key_verifier BLOB;
      ALTER TABLE files ADD COLUMN protected_album INTEGER;",
+    // v9 — poczekalnia obejmuje też pliki bez duplikatu: import skanuje i stage'uje
+    // wszystko, nic nie kopiuje; użytkownik wybiera zaznaczeniem, co trafi do
+    // biblioteki. dup_file_id może być NULL (nowy plik), kind przechowywany lokalnie
+    // (brak wiersza files dla nowych). Tabela przejściowa → bezpieczny DROP+CREATE.
+    "DROP TABLE import_pending;
+    CREATE TABLE import_pending (
+        id          INTEGER PRIMARY KEY,
+        src         TEXT NOT NULL UNIQUE,
+        dst         TEXT NOT NULL,
+        hash        BLOB NOT NULL,
+        dup_file_id INTEGER,
+        kind        INTEGER NOT NULL DEFAULT 0,
+        size        INTEGER NOT NULL,
+        created_at  INTEGER NOT NULL
+    );",
 ];
 
 pub fn open(dir: &Path) -> anyhow::Result<Connection> {

@@ -195,15 +195,18 @@ fn copy_verified(
 pub struct ImportProgress {
     pub done: u64,
     pub total: u64,
-    pub imported: u64,
+    /// pliki bez duplikatu wykryte podczas skanu (jeszcze NIE skopiowane)
+    pub new_files: u64,
     pub duplicates: u64,
     pub errors: u64,
 }
 
-/// Rdzeń importu — bez zależności od Tauri, testowalny headless.
+/// Rdzeń importu — skanuje, liczy hash i wykrywa duplikaty, ale NIC nie kopiuje.
+/// Każdy plik (nowy lub duplikat) trafia do poczekalni `import_pending`; o tym,
+/// co ostatecznie ląduje w bibliotece, decyduje użytkownik przez `resolve_pending`.
+/// Bez zależności od Tauri, testowalny headless.
 pub fn run_core(
     conn: &Connection,
-    root: &Path,
     source: &Path,
     photo_template: &str,
     video_template: &str,
@@ -211,17 +214,11 @@ pub fn run_core(
 ) -> ImportProgress {
     let files = scan_source(source, photo_template, video_template);
     let total = files.len() as u64;
-    conn.execute(
-        "INSERT INTO operations (kind, label, created_at) VALUES ('import', ?1, ?2)",
-        rusqlite::params![source.to_string_lossy(), now()],
-    )
-    .ok();
-    let op_id = conn.last_insert_rowid();
 
     let mut progress = ImportProgress {
         done: 0,
         total,
-        imported: 0,
+        new_files: 0,
         duplicates: 0,
         errors: 0,
     };
@@ -236,28 +233,26 @@ pub fn run_core(
                     |r| r.get(0),
                 )
                 .ok();
-            match dup {
-                Some(dup_id) => {
-                    // duplikat → poczekalnia, plik zostaje w źródle
-                    conn.execute(
-                        "INSERT OR IGNORE INTO import_pending
-                         (src, dst, hash, dup_file_id, size, created_at)
-                         VALUES (?1,?2,?3,?4,?5,?6)",
-                        rusqlite::params![
-                            f.abs.to_string_lossy(),
-                            f.dst_dir,
-                            hash,
-                            dup_id,
-                            f.size,
-                            now()
-                        ],
-                    )?;
-                    progress.duplicates += 1;
-                }
-                None => {
-                    copy_verified(conn, root, &f.abs, f.kind, &hash, &f.dst_dir, op_id)?;
-                    progress.imported += 1;
-                }
+            // nowy plik i duplikat trafiają do tej samej poczekalni; dup_file_id
+            // rozróżnia przypadki. Plik zostaje w źródle — kopia dopiero na wybór.
+            conn.execute(
+                "INSERT OR IGNORE INTO import_pending
+                 (src, dst, hash, dup_file_id, kind, size, created_at)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7)",
+                rusqlite::params![
+                    f.abs.to_string_lossy(),
+                    f.dst_dir,
+                    hash,
+                    dup,
+                    f.kind,
+                    f.size,
+                    now()
+                ],
+            )?;
+            if dup.is_some() {
+                progress.duplicates += 1;
+            } else {
+                progress.new_files += 1;
             }
             Ok(())
         })();
@@ -277,20 +272,14 @@ pub fn run_core(
 pub fn run(app: AppHandle, source: PathBuf, photo_template: String, video_template: String) {
     let data_dir = app.path().app_data_dir().expect("app data dir");
     let conn = db::open(&data_dir).expect("import db");
-    let Some(root) = db::get_setting(&conn, "library_path").map(PathBuf::from) else {
+    // biblioteka musi być ustawiona, żeby resolve_pending miał gdzie kopiować
+    if db::get_setting(&conn, "library_path").is_none() {
         return;
-    };
+    }
     let app2 = app.clone();
-    let progress = run_core(
-        &conn,
-        &root,
-        &source,
-        &photo_template,
-        &video_template,
-        move |p| {
-            app2.emit("import-progress", p.clone()).ok();
-        },
-    );
+    let progress = run_core(&conn, &source, &photo_template, &video_template, move |p| {
+        app2.emit("import-progress", p.clone()).ok();
+    });
     app.emit("import-done", progress).ok();
 }
 
@@ -300,22 +289,24 @@ pub struct PendingItem {
     pub src: String,
     pub dst: String,
     pub size: i64,
-    pub dup_id: i64,
-    pub dup_path: String,
-    pub dup_name: String,
-    pub dup_size: i64,
+    pub kind: i64,
+    /// pola `dup_*` wypełnione tylko dla duplikatów (istnieje wiersz w `files`);
+    /// dla nowych plików są `None`
+    pub dup_id: Option<i64>,
+    pub dup_path: Option<String>,
+    pub dup_name: Option<String>,
+    pub dup_size: Option<i64>,
     pub dup_thumb: Option<String>,
     pub dup_taken_at: Option<i64>,
-    pub kind: i64,
 }
 
 pub fn list_pending(conn: &Connection) -> Vec<PendingItem> {
     let mut stmt = conn
         .prepare_cached(
-            "SELECT p.id, p.src, p.dst, p.size, f.id, f.path, f.name, f.size,
-                    CASE WHEN f.thumb = 1 THEN lower(hex(f.hash)) END, f.taken_at, f.kind
-             FROM import_pending p JOIN files f ON f.id = p.dup_file_id
-             ORDER BY p.id",
+            "SELECT p.id, p.src, p.dst, p.size, p.kind, f.id, f.path, f.name, f.size,
+                    CASE WHEN f.thumb = 1 THEN lower(hex(f.hash)) END, f.taken_at
+             FROM import_pending p LEFT JOIN files f ON f.id = p.dup_file_id
+             ORDER BY p.dup_file_id IS NULL DESC, p.id",
         )
         .expect("stmt");
     stmt.query_map([], |r| {
@@ -324,13 +315,13 @@ pub fn list_pending(conn: &Connection) -> Vec<PendingItem> {
             src: r.get(1)?,
             dst: r.get(2)?,
             size: r.get(3)?,
-            dup_id: r.get(4)?,
-            dup_path: r.get(5)?,
-            dup_name: r.get(6)?,
-            dup_size: r.get(7)?,
-            dup_thumb: r.get(8)?,
-            dup_taken_at: r.get(9)?,
-            kind: r.get(10)?,
+            kind: r.get(4)?,
+            dup_id: r.get(5)?,
+            dup_path: r.get(6)?,
+            dup_name: r.get(7)?,
+            dup_size: r.get(8)?,
+            dup_thumb: r.get(9)?,
+            dup_taken_at: r.get(10)?,
         })
     })
     .map(|rows| rows.filter_map(Result::ok).collect())
@@ -357,8 +348,7 @@ pub fn resolve_pending(
     for id in ids {
         let row: Option<(String, String, Vec<u8>, i64)> = conn
             .query_row(
-                "SELECT p.src, p.dst, p.hash, f.kind FROM import_pending p
-                 JOIN files f ON f.id = p.dup_file_id WHERE p.id = ?1",
+                "SELECT src, dst, hash, kind FROM import_pending WHERE id = ?1",
                 [id],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
             )
@@ -428,33 +418,39 @@ mod tests {
         std::fs::write(source.join("new2.jpg"), b"nowe-22").unwrap();
         std::fs::write(source.join("dup.jpg"), &existing).unwrap();
 
-        let progress = run_core(&conn, &root, &source, "{rok}/{miesiac}", "{rok}", |_| {});
-        assert_eq!(progress.imported, 2);
+        let progress = run_core(&conn, &source, "{rok}/{miesiac}", "{rok}", |_| {});
+        assert_eq!(progress.new_files, 2);
         assert_eq!(progress.duplicates, 1);
         assert_eq!(progress.errors, 0);
 
-        // duplikat NIE został skopiowany, czeka w poczekalni
+        // skan NIC nie kopiuje: wszystko czeka w poczekalni, biblioteka bez zmian
         let pending = list_pending(&conn);
-        assert_eq!(pending.len(), 1);
-        assert_eq!(pending[0].dup_name, "old.jpg");
+        assert_eq!(pending.len(), 3); // 2 nowe + 1 duplikat
+        let dups: Vec<&PendingItem> = pending.iter().filter(|p| p.dup_id.is_some()).collect();
+        let news: Vec<&PendingItem> = pending.iter().filter(|p| p.dup_id.is_none()).collect();
+        assert_eq!(dups.len(), 1);
+        assert_eq!(news.len(), 2);
+        assert_eq!(dups[0].dup_name.as_deref(), Some("old.jpg"));
         let files_count: i64 = conn
             .query_row("SELECT count(*) FROM files", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(files_count, 3); // old + 2 nowe
+        assert_eq!(files_count, 1); // tylko istniejący old.jpg
 
-        // "importuj mimo to" kopiuje duplikat
-        resolve_pending(&conn, &root, &[pending[0].id], "import").unwrap();
+        // "importuj" wybranych: 2 nowe + duplikat → kopiowane do biblioteki
+        let new_ids: Vec<i64> = news.iter().map(|p| p.id).collect();
+        resolve_pending(&conn, &root, &new_ids, "import").unwrap();
+        resolve_pending(&conn, &root, &[dups[0].id], "import").unwrap();
         assert!(list_pending(&conn).is_empty());
         let files_count: i64 = conn
             .query_row("SELECT count(*) FROM files", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(files_count, 4);
+        assert_eq!(files_count, 4); // old + 2 nowe + duplikat
         // źródło nietknięte
         assert!(source.join("dup.jpg").exists());
 
-        // ponowny import: wszystko to duplikaty
-        let progress = run_core(&conn, &root, &source, "{rok}/{miesiac}", "{rok}", |_| {});
-        assert_eq!(progress.imported, 0);
+        // ponowny import: wszystko to teraz duplikaty
+        let progress = run_core(&conn, &source, "{rok}/{miesiac}", "{rok}", |_| {});
+        assert_eq!(progress.new_files, 0);
         assert_eq!(progress.duplicates, 3);
         // "pomiń" czyści poczekalnię bez kopiowania
         let ids: Vec<i64> = list_pending(&conn).iter().map(|p| p.id).collect();
