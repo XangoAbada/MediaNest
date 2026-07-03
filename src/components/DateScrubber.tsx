@@ -19,13 +19,13 @@ function monthYear(ym: string): string {
 export function DateScrubber({
   scrollRef,
   total,
-  cols,
-  rowHeight,
+  offsetOfIndex,
+  indexAtOffset,
 }: {
   scrollRef: React.RefObject<HTMLDivElement | null>;
   total: number;
-  cols: number;
-  rowHeight: number;
+  offsetOfIndex: (fileIdx: number) => number; // indeks pliku → scrollTop
+  indexAtOffset: (scrollTop: number) => number; // scrollTop → indeks pliku
 }) {
   const timeline = useLibrary((s) => s.timeline);
   const trackRef = useRef<HTMLDivElement>(null);
@@ -78,7 +78,7 @@ export function DateScrubber({
     const el = scrollRef.current;
     if (!el) return;
     const onScroll = () => {
-      const topIdx = Math.min(total - 1, Math.floor(el.scrollTop / rowHeight) * cols);
+      const topIdx = Math.min(total - 1, indexAtOffset(el.scrollTop));
       setThumbFrac(total ? topIdx / total : 0);
       setTopDate(dateOfIndex(topIdx));
       setScrolling(true);
@@ -89,7 +89,7 @@ export function DateScrubber({
     onScroll();
     return () => el.removeEventListener("scroll", onScroll);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [scrollRef, total, cols, rowHeight, starts, datedTotal]);
+  }, [scrollRef, total, indexAtOffset, starts, datedTotal]);
 
   if (timeline.length === 0 || total < 50) return null;
 
@@ -101,7 +101,7 @@ export function DateScrubber({
     const el = scrollRef.current;
     if (!el) return;
     const idx = Math.min(total - 1, Math.round(f * total));
-    el.scrollTop = Math.floor(idx / cols) * rowHeight;
+    el.scrollTop = offsetOfIndex(idx);
   };
 
   const bubbleFrac = hoverFrac ?? thumbFrac;

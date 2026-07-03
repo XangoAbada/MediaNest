@@ -65,7 +65,8 @@ export function TimelineView() {
   }
 
   return (
-    <div className="mx-auto max-w-3xl p-6">
+    <div className="h-full overflow-y-auto">
+      <div className="mx-auto max-w-3xl p-6">
       <h2 className="mb-4 text-lg font-semibold tracking-tight">Oś czasu</h2>
       {[...byYear.entries()].map(([year, list]) => (
         <div key={year} className="mb-5">
@@ -88,6 +89,7 @@ export function TimelineView() {
           </div>
         </div>
       ))}
+      </div>
     </div>
   );
 }
